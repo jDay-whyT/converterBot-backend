@@ -1,0 +1,242 @@
+name: Deploy photo-converter monorepo
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AR_REPO: orochimary
+  CONVERTER_IMAGE_NAME: photo-converter
+  BOT_IMAGE_NAME: photo-convert-bot
+
+jobs:
+  deploy_converter:
+    name: Deploy converter
+    runs-on: ubuntu-latest
+    outputs:
+      converter_url: ${{ steps.export_converter_url.outputs.converter_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required configuration
+        shell: bash
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          GCP_REGION: ${{ secrets.GCP_REGION }}
+          CLOUD_RUN_CONVERTER_SERVICE: ${{ secrets.CLOUD_RUN_CONVERTER_SERVICE }}
+          CONVERTER_API_KEY: ${{ secrets.CONVERTER_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          required=(
+            GCP_PROJECT_ID
+            GCP_WIF_PROVIDER
+            GCP_SERVICE_ACCOUNT
+            GCP_REGION
+            CLOUD_RUN_CONVERTER_SERVICE
+            CONVERTER_API_KEY
+          )
+
+          for key in "${required[@]}"; do
+            if [[ -z "${!key:-}" ]]; then
+              echo "Missing required secret: $key" >&2
+              exit 1
+            fi
+          done
+
+      - name: Normalize and validate image/repo names
+        id: names
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ar_repo_lower="$(echo "${AR_REPO}" | tr '[:upper:]' '[:lower:]')"
+          converter_image_lower="$(echo "${CONVERTER_IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
+
+          validate_re='^[a-z0-9]+([._-][a-z0-9]+)*$'
+          for value in "$ar_repo_lower" "$converter_image_lower"; do
+            if [[ ! "$value" =~ $validate_re ]]; then
+              echo "Invalid Artifact Registry/image name: $value" >&2
+              exit 1
+            fi
+          done
+
+          echo "ar_repo=$ar_repo_lower" >> "$GITHUB_OUTPUT"
+          echo "converter_image=$converter_image_lower" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        shell: bash
+        run: |
+          gcloud auth configure-docker "${{ secrets.GCP_REGION }}-docker.pkg.dev" --quiet
+
+      - name: Build and push converter image
+        id: build_push_converter
+        shell: bash
+        env:
+          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          REGION: ${{ secrets.GCP_REGION }}
+        run: |
+          set -euo pipefail
+
+          image_uri="${REGION}-docker.pkg.dev/${PROJECT_ID}/${{ steps.names.outputs.ar_repo }}/${{ steps.names.outputs.converter_image }}:${GITHUB_SHA}"
+          docker build -t "$image_uri" ./converter
+          docker push "$image_uri"
+
+          echo "image_uri=$image_uri" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy converter to Cloud Run
+        id: deploy_converter
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ secrets.CLOUD_RUN_CONVERTER_SERVICE }}
+          region: ${{ secrets.GCP_REGION }}
+          image: ${{ steps.build_push_converter.outputs.image_uri }}
+          env_vars: |
+            CONVERTER_API_KEY=${{ secrets.CONVERTER_API_KEY }}
+            MAX_FILE_MB=${{ vars.MAX_FILE_MB || '40' }}
+
+      - name: Export converter URL
+        id: export_converter_url
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          converter_url="$(gcloud run services describe "${{ secrets.CLOUD_RUN_CONVERTER_SERVICE }}" \
+            --region="${{ secrets.GCP_REGION }}" \
+            --project="${{ secrets.GCP_PROJECT_ID }}" \
+            --format='value(status.url)')"
+
+          if [[ -z "$converter_url" ]]; then
+            echo "Failed to resolve converter URL" >&2
+            exit 1
+          fi
+
+          echo "converter_url=$converter_url" >> "$GITHUB_OUTPUT"
+
+  deploy_bot:
+    name: Deploy bot
+    runs-on: ubuntu-latest
+    needs: deploy_converter
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required configuration
+        shell: bash
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          GCP_REGION: ${{ secrets.GCP_REGION }}
+          CLOUD_RUN_BOT_SERVICE: ${{ secrets.CLOUD_RUN_BOT_SERVICE }}
+          CONVERTER_API_KEY: ${{ secrets.CONVERTER_API_KEY }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          required=(
+            GCP_PROJECT_ID
+            GCP_WIF_PROVIDER
+            GCP_SERVICE_ACCOUNT
+            GCP_REGION
+            CLOUD_RUN_BOT_SERVICE
+            CONVERTER_API_KEY
+          )
+
+          for key in "${required[@]}"; do
+            if [[ -z "${!key:-}" ]]; then
+              echo "Missing required secret: $key" >&2
+              exit 1
+            fi
+          done
+
+          if [[ -z "${BOT_TOKEN:-}" && -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+            echo "Missing required secret: BOT_TOKEN or TELEGRAM_BOT_TOKEN" >&2
+            exit 1
+          fi
+
+      - name: Normalize and validate image/repo names
+        id: names
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ar_repo_lower="$(echo "${AR_REPO}" | tr '[:upper:]' '[:lower:]')"
+          bot_image_lower="$(echo "${BOT_IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
+
+          validate_re='^[a-z0-9]+([._-][a-z0-9]+)*$'
+          for value in "$ar_repo_lower" "$bot_image_lower"; do
+            if [[ ! "$value" =~ $validate_re ]]; then
+              echo "Invalid Artifact Registry/image name: $value" >&2
+              exit 1
+            fi
+          done
+
+          echo "ar_repo=$ar_repo_lower" >> "$GITHUB_OUTPUT"
+          echo "bot_image=$bot_image_lower" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        shell: bash
+        run: |
+          gcloud auth configure-docker "${{ secrets.GCP_REGION }}-docker.pkg.dev" --quiet
+
+      - name: Build and push bot image
+        id: build_push_bot
+        shell: bash
+        env:
+          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          REGION: ${{ secrets.GCP_REGION }}
+        run: |
+          set -euo pipefail
+
+          image_uri="${REGION}-docker.pkg.dev/${PROJECT_ID}/${{ steps.names.outputs.ar_repo }}/${{ steps.names.outputs.bot_image }}:${GITHUB_SHA}"
+          docker build -t "$image_uri" ./bot
+          docker push "$image_uri"
+
+          echo "image_uri=$image_uri" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy bot to Cloud Run
+        id: deploy_bot
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ secrets.CLOUD_RUN_BOT_SERVICE }}
+          region: ${{ secrets.GCP_REGION }}
+          image: ${{ steps.build_push_bot.outputs.image_uri }}
+          env_vars: |
+            BOT_TOKEN=${{ secrets.BOT_TOKEN != '' && secrets.BOT_TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
+            ALLOWED_EDITORS=${{ vars.ALLOWED_EDITORS }}
+            CHAT_ID=${{ vars.CHAT_ID }}
+            TOPIC_SOURCE_ID=${{ vars.TOPIC_SOURCE_ID }}
+            TOPIC_CONVERTED_ID=${{ vars.TOPIC_CONVERTED_ID }}
+            CONVERTER_URL=${{ needs.deploy_converter.outputs.converter_url }}
+            CONVERTER_API_KEY=${{ secrets.CONVERTER_API_KEY }}
+            MAX_FILE_MB=${{ vars.MAX_FILE_MB || '40' }}
+            BATCH_WINDOW_SECONDS=${{ vars.BATCH_WINDOW_SECONDS }}
+            PROGRESS_UPDATE_EVERY=${{ vars.PROGRESS_UPDATE_EVERY }}
