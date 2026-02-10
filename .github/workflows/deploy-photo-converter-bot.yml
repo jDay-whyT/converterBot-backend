@@ -26,9 +26,9 @@ jobs:
       - name: Validate required configuration
         shell: bash
         env:
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
           GCP_WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
-          GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          GCP_SA_EMAIL: ${{ secrets.GCP_SA_EMAIL }}
           GCP_REGION: ${{ secrets.GCP_REGION }}
           CLOUD_RUN_CONVERTER_SERVICE: ${{ secrets.CLOUD_RUN_CONVERTER_SERVICE }}
           CONVERTER_API_KEY: ${{ secrets.CONVERTER_API_KEY }}
@@ -36,9 +36,9 @@ jobs:
           set -euo pipefail
 
           required=(
-            GCP_PROJECT_ID
+            GCP_PROJECT
             GCP_WIF_PROVIDER
-            GCP_SERVICE_ACCOUNT
+            GCP_SA_EMAIL
             GCP_REGION
             CLOUD_RUN_CONVERTER_SERVICE
             CONVERTER_API_KEY
@@ -75,7 +75,7 @@ jobs:
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
 
       - name: Setup gcloud SDK
         uses: google-github-actions/setup-gcloud@v2
@@ -89,7 +89,7 @@ jobs:
         id: build_push_converter
         shell: bash
         env:
-          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          PROJECT_ID: ${{ secrets.GCP_PROJECT }}
           REGION: ${{ secrets.GCP_REGION }}
         run: |
           set -euo pipefail
@@ -119,7 +119,7 @@ jobs:
 
           converter_url="$(gcloud run services describe "${{ secrets.CLOUD_RUN_CONVERTER_SERVICE }}" \
             --region="${{ secrets.GCP_REGION }}" \
-            --project="${{ secrets.GCP_PROJECT_ID }}" \
+            --project="${{ secrets.GCP_PROJECT }}" \
             --format='value(status.url)')"
 
           if [[ -z "$converter_url" ]]; then
@@ -141,9 +141,9 @@ jobs:
       - name: Validate required configuration
         shell: bash
         env:
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
           GCP_WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
-          GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          GCP_SA_EMAIL: ${{ secrets.GCP_SA_EMAIL }}
           GCP_REGION: ${{ secrets.GCP_REGION }}
           CLOUD_RUN_BOT_SERVICE: ${{ secrets.CLOUD_RUN_BOT_SERVICE }}
           CONVERTER_API_KEY: ${{ secrets.CONVERTER_API_KEY }}
@@ -153,9 +153,9 @@ jobs:
           set -euo pipefail
 
           required=(
-            GCP_PROJECT_ID
+            GCP_PROJECT
             GCP_WIF_PROVIDER
-            GCP_SERVICE_ACCOUNT
+            GCP_SA_EMAIL
             GCP_REGION
             CLOUD_RUN_BOT_SERVICE
             CONVERTER_API_KEY
@@ -197,7 +197,7 @@ jobs:
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
 
       - name: Setup gcloud SDK
         uses: google-github-actions/setup-gcloud@v2
@@ -211,7 +211,7 @@ jobs:
         id: build_push_bot
         shell: bash
         env:
-          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          PROJECT_ID: ${{ secrets.GCP_PROJECT }}
           REGION: ${{ secrets.GCP_REGION }}
         run: |
           set -euo pipefail
