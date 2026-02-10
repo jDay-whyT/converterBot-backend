@@ -85,6 +85,51 @@ jobs:
         run: |
           gcloud auth configure-docker "${{ secrets.GCP_REGION }}-docker.pkg.dev" --quiet
 
+      - name: Verify authentication and permissions
+        shell: bash
+        env:
+          PROJECT_ID: ${{ secrets.GCP_PROJECT }}
+          REGION: ${{ secrets.GCP_REGION }}
+        run: |
+          set -euo pipefail
+
+          echo "::group::Verifying GCP authentication"
+          if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -q .; then
+            echo "::error::No active GCP authentication found"
+            exit 1
+          fi
+
+          active_account=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" | head -n1)
+          echo "Authenticated as: $active_account"
+          echo "::endgroup::"
+
+          echo "::group::Verifying Artifact Registry access"
+          ar_repo="${REGION}-docker.pkg.dev/${PROJECT_ID}/${{ steps.names.outputs.ar_repo }}"
+
+          if ! gcloud artifacts repositories describe "${{ steps.names.outputs.ar_repo }}" \
+              --location="${REGION}" \
+              --project="${PROJECT_ID}" &>/dev/null; then
+            echo "::error::Artifact Registry repository not found: ${ar_repo}"
+            echo "Please create the repository or verify the name is correct"
+            exit 1
+          fi
+
+          echo "Artifact Registry repository exists: ${ar_repo}"
+
+          # Test if we can list images (validates read access)
+          if ! gcloud artifacts docker images list "${ar_repo}" --project="${PROJECT_ID}" &>/dev/null; then
+            echo "::warning::Cannot list images in repository (this may be normal for new repos)"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Verifying Docker authentication"
+          if ! docker login "${REGION}-docker.pkg.dev" --username=oauth2accesstoken --password="$(gcloud auth print-access-token)" &>/dev/null; then
+            echo "::error::Docker authentication failed"
+            exit 1
+          fi
+          echo "Docker successfully authenticated to Artifact Registry"
+          echo "::endgroup::"
+
       - name: Build and push converter image
         id: build_push_converter
         shell: bash
@@ -95,8 +140,46 @@ jobs:
           set -euo pipefail
 
           image_uri="${REGION}-docker.pkg.dev/${PROJECT_ID}/${{ steps.names.outputs.ar_repo }}/${{ steps.names.outputs.converter_image }}:${GITHUB_SHA}"
-          docker build -t "$image_uri" ./converter
-          docker push "$image_uri"
+
+          echo "::group::Building Docker image"
+          echo "Building image: $image_uri"
+          if ! docker build -t "$image_uri" ./converter; then
+            echo "::error::Docker build failed"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Pushing Docker image"
+          echo "Pushing image: $image_uri"
+
+          # Retry logic for docker push (network operation)
+          max_attempts=4
+          attempt=1
+          backoff=2
+
+          while [ $attempt -le $max_attempts ]; do
+            echo "Push attempt $attempt of $max_attempts..."
+
+            if docker push "$image_uri"; then
+              echo "Successfully pushed image"
+              echo "::endgroup::"
+              break
+            else
+              if [ $attempt -eq $max_attempts ]; then
+                echo "::error::Failed to push image after $max_attempts attempts"
+                echo "::error::Verify that:"
+                echo "::error::  1. Service account has 'Artifact Registry Writer' role"
+                echo "::error::  2. Workload Identity Federation is correctly configured"
+                echo "::error::  3. Repository exists: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${{ steps.names.outputs.ar_repo }}"
+                exit 1
+              fi
+
+              echo "Push failed, waiting ${backoff}s before retry..."
+              sleep $backoff
+              backoff=$((backoff * 2))
+              attempt=$((attempt + 1))
+            fi
+          done
 
           echo "image_uri=$image_uri" >> "$GITHUB_OUTPUT"
 
@@ -207,6 +290,46 @@ jobs:
         run: |
           gcloud auth configure-docker "${{ secrets.GCP_REGION }}-docker.pkg.dev" --quiet
 
+      - name: Verify authentication and permissions
+        shell: bash
+        env:
+          PROJECT_ID: ${{ secrets.GCP_PROJECT }}
+          REGION: ${{ secrets.GCP_REGION }}
+        run: |
+          set -euo pipefail
+
+          echo "::group::Verifying GCP authentication"
+          if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -q .; then
+            echo "::error::No active GCP authentication found"
+            exit 1
+          fi
+
+          active_account=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" | head -n1)
+          echo "Authenticated as: $active_account"
+          echo "::endgroup::"
+
+          echo "::group::Verifying Artifact Registry access"
+          ar_repo="${REGION}-docker.pkg.dev/${PROJECT_ID}/${{ steps.names.outputs.ar_repo }}"
+
+          if ! gcloud artifacts repositories describe "${{ steps.names.outputs.ar_repo }}" \
+              --location="${REGION}" \
+              --project="${PROJECT_ID}" &>/dev/null; then
+            echo "::error::Artifact Registry repository not found: ${ar_repo}"
+            echo "Please create the repository or verify the name is correct"
+            exit 1
+          fi
+
+          echo "Artifact Registry repository exists: ${ar_repo}"
+          echo "::endgroup::"
+
+          echo "::group::Verifying Docker authentication"
+          if ! docker login "${REGION}-docker.pkg.dev" --username=oauth2accesstoken --password="$(gcloud auth print-access-token)" &>/dev/null; then
+            echo "::error::Docker authentication failed"
+            exit 1
+          fi
+          echo "Docker successfully authenticated to Artifact Registry"
+          echo "::endgroup::"
+
       - name: Build and push bot image
         id: build_push_bot
         shell: bash
@@ -217,8 +340,46 @@ jobs:
           set -euo pipefail
 
           image_uri="${REGION}-docker.pkg.dev/${PROJECT_ID}/${{ steps.names.outputs.ar_repo }}/${{ steps.names.outputs.bot_image }}:${GITHUB_SHA}"
-          docker build -t "$image_uri" ./bot
-          docker push "$image_uri"
+
+          echo "::group::Building Docker image"
+          echo "Building image: $image_uri"
+          if ! docker build -t "$image_uri" ./bot; then
+            echo "::error::Docker build failed"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Pushing Docker image"
+          echo "Pushing image: $image_uri"
+
+          # Retry logic for docker push (network operation)
+          max_attempts=4
+          attempt=1
+          backoff=2
+
+          while [ $attempt -le $max_attempts ]; do
+            echo "Push attempt $attempt of $max_attempts..."
+
+            if docker push "$image_uri"; then
+              echo "Successfully pushed image"
+              echo "::endgroup::"
+              break
+            else
+              if [ $attempt -eq $max_attempts ]; then
+                echo "::error::Failed to push image after $max_attempts attempts"
+                echo "::error::Verify that:"
+                echo "::error::  1. Service account has 'Artifact Registry Writer' role"
+                echo "::error::  2. Workload Identity Federation is correctly configured"
+                echo "::error::  3. Repository exists: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${{ steps.names.outputs.ar_repo }}"
+                exit 1
+              fi
+
+              echo "Push failed, waiting ${backoff}s before retry..."
+              sleep $backoff
+              backoff=$((backoff * 2))
+              attempt=$((attempt + 1))
+            fi
+          done
 
           echo "image_uri=$image_uri" >> "$GITHUB_OUTPUT"
 

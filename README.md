@@ -46,7 +46,24 @@ export CONVERTER_API_KEY=secret
 uvicorn app:app --reload --port 8080
 ```
 
-### Деплой в Cloud Run
+### Автоматический деплой через GitHub Actions
+
+Проект использует GitHub Actions с Workload Identity Federation для автоматического деплоя обоих сервисов.
+
+**Быстрый старт:**
+1. См. [DEPLOYMENT_CHECKLIST.md](DEPLOYMENT_CHECKLIST.md) для проверки конфигурации
+2. См. [docs/GCP_SETUP.md](docs/GCP_SETUP.md) для полной инструкции по настройке GCP
+
+**Запуск деплоя:**
+- Перейдите в **Actions** → **Deploy photo-converter monorepo** → **Run workflow**
+
+**Workflow автоматически:**
+- ✅ Проверяет аутентификацию и права доступа
+- ✅ Собирает Docker-образы для converter и bot
+- ✅ Загружает образы в Artifact Registry
+- ✅ Деплоит оба сервиса в Cloud Run
+
+### Ручной деплой в Cloud Run
 
 ```bash
 cd converter
