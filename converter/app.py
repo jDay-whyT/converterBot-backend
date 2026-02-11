@@ -66,27 +66,57 @@ def _convert_with_magick(input_path: Path, output_path: Path, quality: int, max_
 
 
 def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Optional[int]) -> None:
-    # Try dcraw_emu (libraw-bin) first - better DNG/ProRAW support, then fallback to dcraw
-    decode_cmd = ["-c", "-w", "-q", "3", "-H", "0", str(input_path)]
+    """Convert RAW formats (DNG, CR2, NEF, etc.) to JPEG using libraw and ImageMagick.
+
+    Tries multiple approaches for maximum compatibility:
+    1. dcraw_emu with aggressive demosaicing (best for DNG/ProRAW)
+    2. dcraw_emu with standard settings (fallback)
+    3. dcraw as final fallback
+    """
     raw: bytes | None = None
+    errors: list[str] = []
 
+    # Try dcraw_emu first (libraw-bin) - better DNG/ProRAW support
     if shutil.which("dcraw_emu") is not None:
+        # Approach 1: Aggressive settings for difficult DNG files
+        # -c: write to stdout, -w: use camera white balance
+        # -q 3: adaptive homogeneity-directed demosaicing (best quality)
+        # -H 0: no highlight recovery (prevents clipping issues)
+        # -6: output 16-bit (better for conversion pipeline)
+        aggressive_cmd = ["dcraw_emu", "-c", "-w", "-q", "3", "-H", "0", "-6", str(input_path)]
         try:
-            raw = _run(["dcraw_emu", *decode_cmd])
-        except RuntimeError:
-            raw = None
-
-    if raw is None:
-        try:
-            raw = _run(["dcraw", *decode_cmd])
+            raw = _run(aggressive_cmd)
         except RuntimeError as exc:
-            raise RuntimeError("Cannot decode RAW (libraw/dcraw)") from exc
+            errors.append(f"dcraw_emu(aggressive): {exc}")
 
+        # Approach 2: Standard settings if aggressive failed
+        if raw is None:
+            standard_cmd = ["dcraw_emu", "-c", "-w", "-q", "3", "-H", "0", str(input_path)]
+            try:
+                raw = _run(standard_cmd)
+            except RuntimeError as exc:
+                errors.append(f"dcraw_emu(standard): {exc}")
+
+    # Fallback to dcraw if dcraw_emu failed or not available
+    if raw is None:
+        dcraw_cmd = ["dcraw", "-c", "-w", "-q", "3", "-H", "0", str(input_path)]
+        try:
+            raw = _run(dcraw_cmd)
+        except RuntimeError as exc:
+            errors.append(f"dcraw: {exc}")
+            error_msg = "Cannot decode RAW file. " + " | ".join(errors)
+            raise RuntimeError(error_msg) from exc
+
+    # Convert decoded RAW to JPEG using ImageMagick
     cmd = ["magick", "-", "-auto-orient", "-colorspace", "sRGB"]
     if max_side:
         cmd.extend(["-resize", f"{max_side}x{max_side}>"])
     cmd.extend(["-quality", str(quality), "-strip", str(output_path)])
-    _run(cmd, input_bytes=raw)
+
+    try:
+        _run(cmd, input_bytes=raw)
+    except RuntimeError as exc:
+        raise RuntimeError(f"ImageMagick conversion failed after RAW decode: {exc}") from exc
 
 
 @app.get("/health")
@@ -133,6 +163,11 @@ async def convert(
             else:
                 _convert_with_magick(in_path, out_path, quality, max_side)
         except RuntimeError as exc:
+            # Log detailed error for debugging
+            print(
+                f"status=error ext={suffix} size_bytes={size_bytes} error={str(exc)[:200]}",
+                flush=True,
+            )
             raise HTTPException(status_code=422, detail=f"conversion failed: {exc}") from exc
 
         if not out_path.exists() or out_path.stat().st_size == 0:
@@ -167,3 +202,26 @@ def _check_tools() -> None:
 
     if missing:
         print(f"warning=missing_tools tools={','.join(missing)}", flush=True)
+
+    # Log available RAW converters and versions for debugging
+    raw_tools = []
+    if shutil.which("dcraw_emu") is not None:
+        try:
+            version_output = subprocess.run(
+                ["dcraw_emu"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=2,
+            )
+            version_info = (version_output.stderr or version_output.stdout).decode("utf-8", errors="ignore")
+            # Extract version from first line (e.g., "LibRaw 0.21.1")
+            version_line = version_info.split("\n")[0] if version_info else "version unknown"
+            raw_tools.append(f"dcraw_emu({version_line})")
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            raw_tools.append("dcraw_emu")
+
+    if shutil.which("dcraw") is not None:
+        raw_tools.append("dcraw")
+
+    if raw_tools:
+        print(f"info=raw_converters available={','.join(raw_tools)}", flush=True)
