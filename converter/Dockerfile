@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libraw-bin \
     && rm -rf /var/lib/apt/lists/*
 
-# Install LibRaw 0.21.2 from source
+# Install LibRaw 0.21.2 from source with command-line tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
@@ -37,7 +37,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ./configure --prefix=/usr \
     && make -j$(nproc) \
     && make install \
+    && make install-samples \
     && ldconfig \
+    && which dcraw_emu || (echo "ERROR: dcraw_emu not found after installation" && exit 1) \
     && cd / \
     && rm -rf /tmp/LibRaw-0.21.2* \
     && apt-get purge -y --auto-remove \
