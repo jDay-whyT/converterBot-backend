@@ -10,7 +10,7 @@ class ConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(ValueError) as ctx:
                 _required("MISSING_VAR")
-            self.assertIn("Missing required env var: MISSING_VAR", str(ctx.exception))
+            self.assertIn("Missing required environment variable: MISSING_VAR", str(ctx.exception))
 
     def test_required_returns_value(self) -> None:
         with patch.dict(os.environ, {"TEST_VAR": "test_value"}):
