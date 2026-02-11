@@ -154,5 +154,15 @@ def _check_tools() -> None:
     missing = [tool for tool in ("magick",) if shutil.which(tool) is None]
     if shutil.which("dcraw_emu") is None and shutil.which("dcraw") is None:
         missing.append("dcraw_emu|dcraw")
+
+    # Check for libheif support in ImageMagick
+    try:
+        result = _run(["magick", "-list", "format"])
+        formats = result.decode("utf-8", errors="ignore")
+        if "HEIC" not in formats and "HEIF" not in formats:
+            missing.append("libheif(HEIC/HEIF)")
+    except (RuntimeError, FileNotFoundError):
+        pass
+
     if missing:
         print(f"warning=missing_tools tools={','.join(missing)}", flush=True)
