@@ -70,10 +70,10 @@ class ConversionBot:
         """Initialize resources before starting the bot."""
         logging.info("Initializing httpx.AsyncClient with connection pooling")
         self._http_client = httpx.AsyncClient(
-            timeout=self.settings.conversion_timeout_seconds,
+            timeout=httpx.Timeout(self.settings.conversion_timeout_seconds),
             limits=httpx.Limits(
-                max_connections=50,  # Maximum total connections
-                max_keepalive_connections=20,  # Keep-alive pool size
+                max_connections=10,  # Maximum total connections
+                max_keepalive_connections=5,  # Keep-alive pool size
             ),
         )
         logging.info("httpx.AsyncClient initialized successfully")
@@ -309,9 +309,10 @@ async def _main() -> None:
         # Wait for tasks to complete cancellation
         await asyncio.gather(health_task, polling_task, return_exceptions=True)
 
-        # Cleanup resources
+        # Cleanup resources in proper order
+        await app.dp.stop()  # Stop dispatcher first
         await app.stop()  # Close httpx client
-        await app.bot.session.close()
+        await app.bot.session.close()  # Close bot session last
 
         logging.info("Graceful shutdown complete")
 
