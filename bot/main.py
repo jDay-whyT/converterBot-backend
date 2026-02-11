@@ -5,6 +5,7 @@ import logging
 import os
 import signal
 import tempfile
+from time import perf_counter
 from pathlib import Path
 
 import httpx
@@ -21,13 +22,19 @@ from progress_utils import is_message_not_modified_error
 SUPPORTED_EXTENSIONS = {".heic", ".dng", ".webp", ".tif", ".tiff"}
 
 
+def format_ms(seconds: float | None) -> int | None:
+    if seconds is None:
+        return None
+    return int(seconds * 1000)
+
+
 class ConverterClient:
     def __init__(self, settings: Settings):
         self.settings = settings
 
     async def convert(
         self, path: Path, client: httpx.AsyncClient, quality: int = 92, max_side: int | None = None
-    ) -> bytes:
+    ) -> tuple[bytes, int | None]:
         files = {"file": (path.name, path.read_bytes(), "application/octet-stream")}
         data: dict[str, str | int] = {"quality": quality}
         if max_side:
@@ -35,11 +42,19 @@ class ConverterClient:
 
         headers = {"X-API-KEY": self.settings.converter_api_key}
 
+        request_started = perf_counter()
         response = await client.post(
             f"{self.settings.converter_url}/convert",
             headers=headers,
             files=files,
             data=data,
+        )
+        request_elapsed = perf_counter() - request_started
+        logging.info(
+            "converter_request file=%s status=%s request_ms=%s",
+            path.name,
+            response.status_code,
+            format_ms(request_elapsed),
         )
         response.raise_for_status()
 
@@ -50,7 +65,7 @@ class ConverterClient:
         if content_size < 100:
             raise ValueError(f"Converted file too small: {content_size} bytes (expected at least 100)")
 
-        return response.content
+        return response.content, response.status_code
 
 
 class ConversionBot:
@@ -131,8 +146,39 @@ class ConversionBot:
             return
 
         async with self.semaphore:
+            file_name = document.file_name or document.file_id
+            user_id = message.from_user.id
+            chat_id = message.chat.id
+            in_bytes = 0
+            out_bytes = 0
+            tg_download_s: float | None = None
+            convert_s: float | None = None
+            tg_upload_s: float | None = None
+            total_started = perf_counter()
+            converter_status_code: int | None = None
+            result = "ok"
+            reason: str | None = None
             try:
-                jpg_bytes = await self._download_and_convert(message)
+                if self._http_client is None:
+                    raise RuntimeError("httpx.AsyncClient not initialized. Call start() before processing documents.")
+
+                with tempfile.TemporaryDirectory(prefix="tg-file-") as tmpdir:
+                    source = Path(tmpdir) / (document.file_name or "input.bin")
+                    file_info = await self.bot.get_file(document.file_id)
+
+                    download_started = perf_counter()
+                    await self.bot.download_file(file_info.file_path, destination=source)
+                    tg_download_s = perf_counter() - download_started
+                    in_bytes = source.stat().st_size
+
+                    convert_started = perf_counter()
+                    jpg_bytes, converter_status_code = await self.converter.convert(
+                        source,
+                        self._http_client,
+                        quality=self.settings.conversion_quality,
+                    )
+                    convert_s = perf_counter() - convert_started
+                    out_bytes = len(jpg_bytes)
 
                 # Validate jpg_bytes before sending
                 if not jpg_bytes or len(jpg_bytes) < 100:
@@ -141,28 +187,43 @@ class ConversionBot:
                 target_name = f"{Path(document.file_name or 'file').stem}.jpg"
                 logging.info(f"Sending {target_name} to Telegram: {len(jpg_bytes)} bytes")
 
+                upload_started = perf_counter()
                 await self.bot.send_document(
                     chat_id=self.settings.chat_id,
                     message_thread_id=self.settings.topic_converted_id,
                     document=BufferedInputFile(jpg_bytes, filename=target_name),
                 )
+                tg_upload_s = perf_counter() - upload_started
                 await self._register_result(batch, True, document.file_name or "file", None)
             except httpx.HTTPStatusError as exc:
+                converter_status_code = exc.response.status_code if exc.response is not None else None
                 reason = exc.response.text[:120] if exc.response is not None else str(exc)
+                result = "error"
                 await self._register_result(batch, False, document.file_name or "file", reason)
             except Exception as exc:  # noqa: BLE001
-                await self._register_result(batch, False, document.file_name or "file", str(exc))
-
-    async def _download_and_convert(self, message: Message) -> bytes:
-        assert message.document
-        if self._http_client is None:
-            raise RuntimeError("httpx.AsyncClient not initialized. Call start() before processing documents.")
-
-        with tempfile.TemporaryDirectory(prefix="tg-file-") as tmpdir:
-            source = Path(tmpdir) / (message.document.file_name or "input.bin")
-            file_info = await self.bot.get_file(message.document.file_id)
-            await self.bot.download_file(file_info.file_path, destination=source)
-            return await self.converter.convert(source, self._http_client, quality=self.settings.conversion_quality)
+                reason = str(exc)
+                result = "error"
+                await self._register_result(batch, False, document.file_name or "file", reason)
+            finally:
+                total_s = perf_counter() - total_started
+                short_reason = (reason or "").replace("\n", " ")[:120] or "-"
+                logging.info(
+                    "file_pipeline file=%s user_id=%s chat_id=%s tg_download_ms=%s convert_ms=%s "
+                    "tg_upload_ms=%s total_ms=%s in_bytes=%s out_bytes=%s converter_status_code=%s "
+                    "result=%s reason=%s",
+                    file_name,
+                    user_id,
+                    chat_id,
+                    format_ms(tg_download_s),
+                    format_ms(convert_s),
+                    format_ms(tg_upload_s),
+                    format_ms(total_s),
+                    in_bytes,
+                    out_bytes,
+                    converter_status_code,
+                    result,
+                    short_reason,
+                )
 
     async def _register_result(self, batch: BatchProgress, ok: bool, file_name: str, reason: str | None) -> None:
         async with batch.lock:
