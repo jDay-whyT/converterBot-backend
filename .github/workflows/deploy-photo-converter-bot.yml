@@ -407,5 +407,5 @@ jobs:
             CONVERTER_URL=${{ needs.deploy_converter.outputs.converter_url }}
             CONVERTER_API_KEY=${{ secrets.CONVERTER_API_KEY }}
             MAX_FILE_MB=${{ vars.MAX_FILE_MB || '40' }}
-            BATCH_WINDOW_SECONDS=${{ vars.BATCH_WINDOW_SECONDS }}
-            PROGRESS_UPDATE_EVERY=${{ vars.PROGRESS_UPDATE_EVERY }}
+            BATCH_WINDOW_SECONDS=${{ vars.BATCH_WINDOW_SECONDS || '120' }}
+            PROGRESS_UPDATE_EVERY=${{ vars.PROGRESS_UPDATE_EVERY || '3' }}

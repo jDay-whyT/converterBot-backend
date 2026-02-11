@@ -37,6 +37,22 @@ def _parse_allowed(raw: str) -> set[int]:
 
 
 def load_settings() -> Settings:
+    import logging
+
+    # Log environment variable status for debugging
+    logging.info("Loading configuration from environment variables...")
+    required_vars = [
+        "BOT_TOKEN", "ALLOWED_EDITORS", "CHAT_ID", "TOPIC_SOURCE_ID",
+        "TOPIC_CONVERTED_ID", "CONVERTER_URL", "CONVERTER_API_KEY"
+    ]
+    for var in required_vars:
+        value = os.getenv(var)
+        if value:
+            masked = "***" if "TOKEN" in var or "KEY" in var else value[:50]
+            logging.info(f"  {var}={masked}")
+        else:
+            logging.error(f"  {var}=<MISSING>")
+
     allowed_editors = _parse_allowed(_required("ALLOWED_EDITORS"))
     if not allowed_editors:
         raise ValueError(
@@ -52,7 +68,7 @@ def load_settings() -> Settings:
         topic_converted_id=int(_required("TOPIC_CONVERTED_ID")),
         converter_url=_required("CONVERTER_URL").rstrip("/"),
         converter_api_key=_required("CONVERTER_API_KEY"),
-        max_file_mb=int(os.getenv("MAX_FILE_MB", "40")),
-        batch_window_seconds=int(os.getenv("BATCH_WINDOW_SECONDS", "120")),
-        progress_update_every=int(os.getenv("PROGRESS_UPDATE_EVERY", "3")),
+        max_file_mb=int(os.getenv("MAX_FILE_MB") or "40"),
+        batch_window_seconds=int(os.getenv("BATCH_WINDOW_SECONDS") or "120"),
+        progress_update_every=int(os.getenv("PROGRESS_UPDATE_EVERY") or "3"),
     )
