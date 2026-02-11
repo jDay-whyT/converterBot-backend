@@ -38,13 +38,17 @@ app = FastAPI(title="converter-service")
 
 
 def _run(cmd: list[str], input_bytes: bytes | None = None) -> bytes:
-    proc = subprocess.run(
-        cmd,
-        input=input_bytes,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=input_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"command not found: {cmd[0]}") from exc
+
     if proc.returncode != 0:
         stderr = proc.stderr.decode("utf-8", errors="ignore").strip()
         raise RuntimeError(stderr or f"command failed: {' '.join(cmd)}")
@@ -73,14 +77,14 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
     if shutil.which("dcraw_emu") is not None:
         try:
             raw = _run(["dcraw_emu", *decode_cmd])
-        except RuntimeError:
+        except (RuntimeError, FileNotFoundError):
             raw = None
 
     if raw is None:
         try:
             raw = _run(["dcraw", *decode_cmd])
-        except RuntimeError as exc:
-            raise RuntimeError("Cannot decode RAW (libraw/dcraw)") from exc
+        except (RuntimeError, FileNotFoundError) as exc:
+            raise RuntimeError("Cannot decode RAW (libraw/dcraw not available)") from exc
 
     cmd = ["magick", "-", "-auto-orient", "-colorspace", "sRGB"]
     if max_side:
