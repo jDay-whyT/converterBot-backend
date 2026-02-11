@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import time
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
@@ -33,15 +32,12 @@ class TelegramApiRetryTests(unittest.IsolatedAsyncioTestCase):
             "success",
         ]
 
-        start_time = time.perf_counter()
-        result = await telegram_api_retry(mock_func, max_retries=2)
-        elapsed = time.perf_counter() - start_time
+        with patch("telegram_retry.asyncio.sleep", new_callable=AsyncMock) as sleep_mock:
+            result = await telegram_api_retry(mock_func, max_retries=2)
 
         self.assertEqual(result, "success")
         self.assertEqual(mock_func.call_count, 2)
-        # Should sleep retry_after + 1 = 2 seconds
-        self.assertGreaterEqual(elapsed, 2.0)
-        self.assertLess(elapsed, 2.5)  # Some buffer for execution time
+        sleep_mock.assert_awaited_once_with(2)
 
     async def test_retry_after_max_retries_exceeded(self) -> None:
         """Test that TelegramRetryAfter raises after max retries."""
@@ -167,6 +163,27 @@ class TelegramFileSemaphoreTests(unittest.IsolatedAsyncioTestCase):
         for i in range(0, 6, 2):
             task_num = results[i].split("_")[1]
             self.assertEqual(results[i + 1], f"end_{task_num}")
+
+    async def test_send_document_runs_one_at_a_time(self) -> None:
+        """Test semaphore guarantees single concurrent send_document execution."""
+        semaphore = TelegramFileSemaphore()
+        send_document = AsyncMock()
+        active = 0
+        max_active = 0
+
+        async def guarded_send(task_id: int) -> None:
+            nonlocal active, max_active
+            async with semaphore:
+                active += 1
+                max_active = max(max_active, active)
+                await send_document(task_id)
+                await asyncio.sleep(0.01)
+                active -= 1
+
+        await asyncio.gather(*(guarded_send(i) for i in range(5)))
+
+        self.assertEqual(send_document.await_count, 5)
+        self.assertEqual(max_active, 1)
 
 
 class ProgressDebouncerTests(unittest.TestCase):

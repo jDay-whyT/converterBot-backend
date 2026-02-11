@@ -75,7 +75,7 @@ class ConversionBot:
         self.registry = BatchRegistry(settings.batch_window_seconds)
         self.converter = ConverterClient(settings)
         self.semaphore = asyncio.Semaphore(2)
-        self.file_semaphore = TelegramFileSemaphore()
+        self.file_send_lock = TelegramFileSemaphore()
         self.progress_debouncer = ProgressDebouncer(min_interval=3.0, min_files=3)
         self._http_client: httpx.AsyncClient | None = None
         self._bind_handlers()
@@ -106,9 +106,17 @@ class ConversionBot:
 
     async def _start(self, message: Message) -> None:
         if not self._is_allowed_user(message):
-            await message.answer("Нет доступа")
+            await telegram_api_retry(
+                message.answer,
+                "Нет доступа",
+                max_retries=2,
+            )
             return
-        await message.answer("Готов конвертировать документы в JPG")
+        await telegram_api_retry(
+            message.answer,
+            "Готов конвертировать документы в JPG",
+            max_retries=2,
+        )
 
     def _is_allowed_user(self, message: Message) -> bool:
         user = message.from_user
@@ -122,7 +130,11 @@ class ConversionBot:
 
     async def _handle_document(self, message: Message) -> None:
         if not self._is_allowed_user(message):
-            await message.answer("Нет доступа")
+            await telegram_api_retry(
+                message.answer,
+                "Нет доступа",
+                max_retries=2,
+            )
             return
 
         if not self._is_source_topic(message):
@@ -158,6 +170,7 @@ class ConversionBot:
             total_started = perf_counter()
             converter_status_code: int | None = None
             result = "ok"
+            ok = False
             reason: str | None = None
             try:
                 if self._http_client is None:
@@ -198,7 +211,7 @@ class ConversionBot:
                 logging.info(f"Sending {target_name} to Telegram: {len(jpg_bytes)} bytes")
 
                 upload_started = perf_counter()
-                async with self.file_semaphore:
+                async with self.file_send_lock:
                     await telegram_api_retry(
                         self.bot.send_document,
                         chat_id=self.settings.chat_id,
@@ -207,17 +220,16 @@ class ConversionBot:
                         max_retries=2,
                     )
                 tg_upload_s = perf_counter() - upload_started
-                await self._register_result(batch, True, document.file_name or "file", None)
+                ok = True
             except httpx.HTTPStatusError as exc:
                 converter_status_code = exc.response.status_code if exc.response is not None else None
                 reason = exc.response.text[:120] if exc.response is not None else str(exc)
                 result = "error"
-                await self._register_result(batch, False, document.file_name or "file", reason)
             except Exception as exc:  # noqa: BLE001
                 reason = str(exc)
                 result = "error"
-                await self._register_result(batch, False, document.file_name or "file", reason)
             finally:
+                await self._register_result(batch, ok, document.file_name or "file", reason)
                 total_s = perf_counter() - total_started
                 short_reason = (reason or "").replace("\n", " ")[:120] or "-"
                 logging.info(
@@ -259,7 +271,10 @@ class ConversionBot:
                 current_time=current_time,
             )
             if needs_update:
-                await self._update_progress(batch)
+                try:
+                    await self._update_progress(batch)
+                except Exception as exc:  # noqa: BLE001
+                    logging.warning("Failed to update progress message: %s", exc)
 
             # Clean up debouncer state when batch is complete
             if batch.processed == batch.total:
