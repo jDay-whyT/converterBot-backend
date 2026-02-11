@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zlib1g \
     wget \
     ca-certificates \
+    libraw-bin \
     && rm -rf /var/lib/apt/lists/*
 
 # Install LibRaw 0.21.2 from source
