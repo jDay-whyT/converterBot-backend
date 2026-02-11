@@ -139,6 +139,60 @@ gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
 
 **Fix:** Review the error message to identify which secret is missing, then add it in GitHub Settings
 
+### Bot Gets 403 Error When Calling Converter
+
+**Cause:** Cloud Run converter service requires authentication but bot doesn't have proper permissions
+
+**Fix Options:**
+
+**Option 1: Public converter (simpler)**
+```bash
+gcloud run services update "${CLOUD_RUN_CONVERTER_SERVICE}" \
+  --region="${REGION}" \
+  --allow-unauthenticated
+```
+
+**Option 2: Private converter with IAM (more secure)**
+1. Keep converter with authentication enabled
+2. Grant bot service account access to invoke converter:
+```bash
+# Get the bot service account
+BOT_SA=$(gcloud run services describe "${CLOUD_RUN_BOT_SERVICE}" \
+  --region="${REGION}" \
+  --format="value(spec.template.spec.serviceAccountName)")
+
+# Grant run.invoker role to bot service account for converter service
+gcloud run services add-iam-policy-binding "${CLOUD_RUN_CONVERTER_SERVICE}" \
+  --region="${REGION}" \
+  --member="serviceAccount:${BOT_SA}" \
+  --role="roles/run.invoker"
+```
+
+**Note:** The bot now automatically includes ID tokens when calling the converter, so both options work seamlessly.
+
+### ALLOWED_EDITORS Format Issues
+
+**Cause:** Incorrect environment variable format
+
+**Fix:** Ensure `ALLOWED_EDITORS` in GitHub Variables uses pipe-separated format:
+```
+# Correct format (pipe-separated):
+123456789|987654321|555555555
+
+# Also supported (comma-separated):
+123456789,987654321,555555555
+
+# Also supported (space-separated):
+123456789 987654321 555555555
+```
+
+Verify in Cloud Run:
+```bash
+gcloud run services describe "${CLOUD_RUN_BOT_SERVICE}" \
+  --region="${REGION}" \
+  --format="value(spec.template.spec.containers[0].env)"
+```
+
 ## 📚 Detailed Setup Guide
 
 For comprehensive setup instructions, see [docs/GCP_SETUP.md](docs/GCP_SETUP.md)
