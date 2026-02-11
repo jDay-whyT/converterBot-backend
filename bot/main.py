@@ -114,7 +114,7 @@ class ConversionBot:
             return
         await telegram_api_retry(
             message.answer,
-            "Готов конвертировать документы в JPG",
+            "Switch with heic, dng, webp, tif, tiff to JPG",
             max_retries=2,
         )
 
@@ -282,7 +282,6 @@ class ConversionBot:
 
     async def _update_progress(self, batch: BatchProgress) -> None:
         text_lines = [
-            f"Пачка от user {batch.user_id}",
             f"Обработано: {batch.processed}/{batch.total}",
             f"Успешно: {batch.success}",
             f"Ошибок: {batch.failed}",
