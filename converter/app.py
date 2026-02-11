@@ -66,6 +66,7 @@ def _convert_with_magick(input_path: Path, output_path: Path, quality: int, max_
 
 
 def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Optional[int]) -> None:
+    # Try dcraw_emu (libraw-bin) first - better DNG/ProRAW support, then fallback to dcraw
     decode_cmd = ["-c", "-w", "-q", "3", "-H", "0", str(input_path)]
     raw: bytes | None = None
 
