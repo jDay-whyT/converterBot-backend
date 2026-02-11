@@ -7,7 +7,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     imagemagick \
     libheif1 \
-    libheif-examples \
+    libde265-0 \
+    libraw-bin \
     dcraw \
     && rm -rf /var/lib/apt/lists/*
 

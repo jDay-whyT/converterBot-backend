@@ -12,7 +12,27 @@ from fastapi.responses import Response
 API_KEY = os.getenv("CONVERTER_API_KEY", "")
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "40"))
 
-ALLOWED_SUFFIXES = {".heic", ".dng", ".webp", ".tif", ".tiff"}
+RAW_SUFFIXES = {
+    ".dng",
+    ".cr2",
+    ".cr3",
+    ".nef",
+    ".nrw",
+    ".arw",
+    ".raf",
+    ".rw2",
+    ".orf",
+    ".pef",
+    ".srw",
+    ".x3f",
+    ".3fr",
+    ".iiq",
+    ".dcr",
+    ".kdc",
+    ".mrw",
+}
+
+ALLOWED_SUFFIXES = {".heic", ".heif", ".webp", ".tif", ".tiff", *RAW_SUFFIXES}
 
 app = FastAPI(title="converter-service")
 
@@ -45,8 +65,22 @@ def _convert_with_magick(input_path: Path, output_path: Path, quality: int, max_
     _run(cmd)
 
 
-def _convert_dng(input_path: Path, output_path: Path, quality: int, max_side: Optional[int]) -> None:
-    raw = _run(["dcraw", "-c", "-w", "-q", "3", "-H", "0", str(input_path)])
+def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Optional[int]) -> None:
+    decode_cmd = ["-c", "-w", "-q", "3", "-H", "0", str(input_path)]
+    raw: bytes | None = None
+
+    if shutil.which("dcraw_emu") is not None:
+        try:
+            raw = _run(["dcraw_emu", *decode_cmd])
+        except RuntimeError:
+            raw = None
+
+    if raw is None:
+        try:
+            raw = _run(["dcraw", *decode_cmd])
+        except RuntimeError as exc:
+            raise RuntimeError("Cannot decode RAW (libraw/dcraw)") from exc
+
     cmd = ["magick", "-", "-auto-orient", "-colorspace", "sRGB"]
     if max_side:
         cmd.extend(["-resize", f"{max_side}x{max_side}>"])
@@ -93,8 +127,8 @@ async def convert(
         in_path.write_bytes(content)
 
         try:
-            if suffix == ".dng":
-                _convert_dng(in_path, out_path, quality, max_side)
+            if suffix in RAW_SUFFIXES:
+                _convert_raw(in_path, out_path, quality, max_side)
             else:
                 _convert_with_magick(in_path, out_path, quality, max_side)
         except RuntimeError as exc:
@@ -117,6 +151,8 @@ async def convert(
 
 @app.on_event("startup")
 def _check_tools() -> None:
-    missing = [tool for tool in ("magick", "dcraw") if shutil.which(tool) is None]
+    missing = [tool for tool in ("magick",) if shutil.which(tool) is None]
+    if shutil.which("dcraw_emu") is None and shutil.which("dcraw") is None:
+        missing.append("dcraw_emu|dcraw")
     if missing:
         print(f"warning=missing_tools tools={','.join(missing)}", flush=True)

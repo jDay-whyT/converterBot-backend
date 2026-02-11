@@ -3,6 +3,8 @@
 Монорепозиторий с двумя Cloud Run сервисами:
 
 1. **`photo-converter`** — HTTP API `POST /convert` (FastAPI + ImageMagick/dcraw).
+   - RAW поддержка через LibRaw (`dcraw_emu`) с fallback на `dcraw`: `.dng,.cr2,.cr3,.nef,.nrw,.arw,.raf,.rw2,.orf,.pef,.srw,.x3f,.3fr,.iiq,.dcr,.kdc,.mrw`
+   - HEIF/HEIC поддержка через `libheif` (`.heic`, `.heif`)
 2. **`photo-convert-bot`** — Telegram-бот на aiogram (polling), который отправляет файлы в converter и публикует JPG в целевой топик.
 
 ---
