@@ -1,41 +1,195 @@
 # Converter Bot Backend
 
-Telegram-бот для конвертации входных фото-документов в JPG через отдельный converter service.
+Монорепозиторий с двумя Cloud Run сервисами:
 
-## Структура
-
-- `bot/` — aiogram 3.x бот
-- `converter/` — FastAPI сервис конвертации (Cloud Run)
-
-## Поддерживаемые форматы
-
-Вход: `.heic`, `.dng`, `.webp`, `.tif`, `.tiff`  
-Выход: `.jpg`
-
-По умолчанию:
-- `quality=92`
-- `-auto-orient`
-- `-colorspace sRGB`
-- `-strip`
-
-Опционально: `max_side` для ресайза по большей стороне.
+1. **`photo-converter`** — HTTP API `POST /convert` (FastAPI + ImageMagick/dcraw).
+2. **`photo-convert-bot`** — Telegram-бот на aiogram (polling), который отправляет файлы в converter и публикует JPG в целевой топик.
 
 ---
 
-## Converter (Cloud Run)
+## Overview / Architecture
 
-### API
+### Зачем разделение на 2 сервиса
 
-`POST /convert`
+- **Изоляция ответственности:**
+  - `photo-converter` занимается только конвертацией файлов.
+  - `photo-convert-bot` занимается только Telegram polling, batching, прогрессом и отправкой результатов.
+- **Независимый деплой:** можно выкатывать bot и converter отдельно в одном workflow.
+- **Независимое масштабирование:** настройки Cloud Run и ресурсы можно задавать под профиль нагрузки каждого сервиса.
 
-- multipart field `file`
-- optional form fields:
-  - `quality` (int, default 92)
-  - `max_side` (int, optional)
-- header: `X-API-KEY: <CONVERTER_API_KEY>`
-- response: `image/jpeg` bytes
+### Поток запроса
 
-### Локальный запуск
+1. Пользователь отправляет `document` в source topic.
+2. Бот проверяет доступ пользователя (`ALLOWED_EDITORS`) и что сообщение пришло в нужный чат/топик.
+3. Бот скачивает файл из Telegram, вызывает `${CONVERTER_URL}/convert` с заголовком `X-API-KEY`.
+4. Converter валидирует `X-API-KEY`, расширение, размер файла и возвращает `image/jpeg`.
+5. Бот отправляет JPG в converted topic и обновляет batched progress.
+
+### Аутентификация между сервисами (prod)
+
+- Converter сервис **публичный на уровне Cloud Run IAM** (`allUsers` + `roles/run.invoker`).
+- Дополнительная (и обязательная) защита — заголовок `X-API-KEY` со значением `CONVERTER_API_KEY`.
+- **Cloud Run ID-token auth не используется** в этой архитектуре.
+
+---
+
+## Env vars
+
+Ниже только переменные, которые реально используются кодом и/или workflow.
+
+### `photo-convert-bot`
+
+Обязательные:
+
+- `BOT_TOKEN`
+- `ALLOWED_EDITORS` (поддерживаются разделители: `,`, `|`, пробел)
+- `CHAT_ID`
+- `TOPIC_SOURCE_ID`
+- `TOPIC_CONVERTED_ID`
+- `CONVERTER_URL` (в workflow подставляется автоматически из URL converter-сервиса)
+- `CONVERTER_API_KEY`
+
+Опциональные:
+
+- `MAX_FILE_MB` (по умолчанию `40`)
+- `BATCH_WINDOW_SECONDS` (по умолчанию `120`)
+- `PROGRESS_UPDATE_EVERY` (по умолчанию `3`)
+- `PORT` (для health HTTP-сервера, по умолчанию `8080`)
+
+### `photo-converter`
+
+Обязательные:
+
+- `CONVERTER_API_KEY`
+
+Опциональные:
+
+- `MAX_FILE_MB` (по умолчанию `40`)
+
+---
+
+## Deploy (GitHub Actions)
+
+Деплой выполняется workflow:
+
+- `.github/workflows/deploy-photo-converter-bot.yml`
+- запуск: **Actions → Deploy photo-converter monorepo → Run workflow**
+
+### Что нужно в GitHub Secrets
+
+- `GCP_PROJECT`
+- `GCP_WIF_PROVIDER`
+- `GCP_SA_EMAIL`
+- `GCP_REGION`
+- `CLOUD_RUN_CONVERTER_SERVICE`
+- `CLOUD_RUN_BOT_SERVICE`
+- `CONVERTER_API_KEY`
+- `BOT_TOKEN` **или** `TELEGRAM_BOT_TOKEN`
+
+### Что нужно в GitHub Variables
+
+- `ALLOWED_EDITORS`
+- `CHAT_ID`
+- `TOPIC_SOURCE_ID`
+- `TOPIC_CONVERTED_ID`
+- `MAX_FILE_MB` (опционально, иначе `40`)
+- `BATCH_WINDOW_SECONDS` (опционально)
+- `PROGRESS_UPDATE_EVERY` (опционально)
+
+### Как бот получает URL converter-сервиса
+
+В workflow есть шаг `Get converter URL`, который читает:
+
+```bash
+gcloud run services describe "${CLOUD_RUN_CONVERTER_SERVICE}" \
+  --region="${GCP_REGION}" \
+  --project="${GCP_PROJECT}" \
+  --format='value(status.url)'
+```
+
+Результат пробрасывается в bot как `CONVERTER_URL`.
+
+### Важные Cloud Run настройки для `photo-convert-bot` (prod)
+
+Для снижения cold start и стабильного polling в проде сервис бота должен быть с настройками:
+
+- `min-instances=1`
+- `startup-cpu-boost=true`
+- `cpu-throttling=false` (`--no-cpu-throttling`)
+- ресурсы: `cpu=2`, `memory=1Gi`
+
+Если нужно применить вручную:
+
+```bash
+gcloud run services update photo-convert-bot \
+  --region="${GCP_REGION}" \
+  --min-instances=1 \
+  --cpu-boost \
+  --no-cpu-throttling \
+  --cpu=2 \
+  --memory=1Gi
+```
+
+---
+
+## Make converter public (Cloud Run IAM)
+
+```bash
+gcloud run services add-iam-policy-binding photo-converter \
+  --region="${GCP_REGION}" \
+  --member="allUsers" \
+  --role="roles/run.invoker"
+```
+
+Проверка:
+
+```bash
+gcloud run services get-iam-policy photo-converter \
+  --region="${GCP_REGION}" \
+  --format='table(bindings.role, bindings.members)'
+```
+
+---
+
+## Runtime notes (bot)
+
+В боте реализовано:
+
+- app-scoped `httpx.AsyncClient` с connection pool.
+- тайминги этапов в логах: `tg_download`, `convert`, `tg_upload`, `total`.
+- retry для Telegram API вызовов.
+- debouncer progress-обновлений + защита от flood control при отправке файлов.
+
+---
+
+## Troubleshooting
+
+### 403 при вызове converter
+
+Проверьте:
+
+1. Converter действительно публичный (`allUsers` + `roles/run.invoker`).
+2. Бот отправляет корректный `X-API-KEY`.
+3. В bot и converter одинаковое значение `CONVERTER_API_KEY`.
+
+### Пачка «зависает» или обновляется рывками
+
+Обычно это ограничения Telegram (flood control) при частых отправках/редактированиях.
+В проекте уже есть retry и debouncer; при высокой нагрузке дополнительно проверьте объем/частоту входящих файлов.
+
+### Медленная обработка
+
+Частые причины в Cloud Run для бота:
+
+- включен CPU throttling;
+- недостаточный CPU (например, `cpu=1`);
+- отсутствует `min-instances=1` (холодные старты).
+
+---
+
+## Локальный запуск (кратко)
+
+### Converter
 
 ```bash
 cd converter
@@ -46,56 +200,7 @@ export CONVERTER_API_KEY=secret
 uvicorn app:app --reload --port 8080
 ```
 
-### Автоматический деплой через GitHub Actions
-
-Проект использует GitHub Actions с Workload Identity Federation для автоматического деплоя обоих сервисов.
-
-**Быстрый старт:**
-1. См. [DEPLOYMENT_CHECKLIST.md](DEPLOYMENT_CHECKLIST.md) для проверки конфигурации
-2. См. [docs/GCP_SETUP.md](docs/GCP_SETUP.md) для полной инструкции по настройке GCP
-
-**Запуск деплоя:**
-- Перейдите в **Actions** → **Deploy photo-converter monorepo** → **Run workflow**
-
-**Workflow автоматически:**
-- ✅ Проверяет аутентификацию и права доступа
-- ✅ Собирает Docker-образы для converter и bot
-- ✅ Загружает образы в Artifact Registry
-- ✅ Деплоит оба сервиса в Cloud Run
-
-### Ручной деплой в Cloud Run
-
-```bash
-cd converter
-gcloud builds submit --tag gcr.io/<PROJECT_ID>/converter-bot
-gcloud run deploy converter-bot \
-  --image gcr.io/<PROJECT_ID>/converter-bot \
-  --region <REGION> \
-  --platform managed \
-  --allow-unauthenticated \
-  --set-env-vars CONVERTER_API_KEY=<SECRET>,MAX_FILE_MB=40
-```
-
-> Converter Cloud Run публичный (IAM `allUsers` + `roles/run.invoker`). Защита запросов выполняется только через `CONVERTER_API_KEY` в заголовке `X-API-KEY`.
-
----
-
-## Bot (aiogram)
-
-### Env vars
-
-- `BOT_TOKEN`
-- `ALLOWED_EDITORS` — comma-separated user IDs
-- `CHAT_ID`
-- `TOPIC_SOURCE_ID`
-- `TOPIC_CONVERTED_ID`
-- `CONVERTER_URL`
-- `CONVERTER_API_KEY`
-- `MAX_FILE_MB` (default `40`)
-- `BATCH_WINDOW_SECONDS` (default `120`)
-- `PROGRESS_UPDATE_EVERY` (default `3`)
-
-### Локальный запуск
+### Bot
 
 ```bash
 cd bot
@@ -110,21 +215,4 @@ export TOPIC_CONVERTED_ID=11
 export CONVERTER_URL=https://<cloud-run-url>
 export CONVERTER_API_KEY=<SECRET>
 python main.py
-```
-
-## Поведение бота
-
-- Принимает **только document** в нужном `CHAT_ID + TOPIC_SOURCE_ID`
-- Проверяет `user_id` в `ALLOWED_EDITORS`
-- Формирует пачку по окну `BATCH_WINDOW_SECONDS` для одного пользователя
-- Ведёт **одно progress-сообщение** на пачку и редактирует каждые `PROGRESS_UPDATE_EVERY` файлов
-- Ошибки отдельных файлов не останавливают остальную обработку
-- Отправляет результат в `TOPIC_CONVERTED_ID` отдельными документами (`.jpg`) без ZIP
-- Сохраняет базовое имя (`same stem + .jpg`)
-
-## Тесты
-
-```bash
-cd bot
-PYTHONPATH=. python -m unittest discover -s tests -p 'test_*.py' -v
 ```
