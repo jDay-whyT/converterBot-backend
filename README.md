@@ -3,8 +3,10 @@
 Монорепозиторий с двумя Cloud Run сервисами:
 
 1. **`photo-converter`** — HTTP API `POST /convert` (FastAPI + ImageMagick/dcraw).
-   - RAW поддержка через LibRaw (`dcraw_emu`) с fallback на `dcraw`: `.dng,.cr2,.cr3,.nef,.nrw,.arw,.raf,.rw2,.orf,.pef,.srw,.x3f,.3fr,.iiq,.dcr,.kdc,.mrw`
-   - HEIF/HEIC поддержка через `libheif` (`.heic`, `.heif`)
+   - **RAW поддержка** через LibRaw (`dcraw_emu`) с fallback на `dcraw`:
+     - **DNG** (включая Apple ProRAW), CR2, CR3, NEF, NRW, ARW, RAF, RW2, ORF, PEF, SRW, X3F, 3FR, IIQ, DCR, KDC, MRW
+     - Установлены `libraw-bin` (содержит `dcraw_emu`) и `dcraw` для максимальной совместимости
+   - **HEIF/HEIC поддержка** через `libheif` (`.heic`, `.heif`)
 2. **`photo-convert-bot`** — Telegram-бот на aiogram (polling), который отправляет файлы в converter и публикует JPG в целевой топик.
 
 ---
@@ -186,6 +188,36 @@ gcloud run services get-iam-policy photo-converter \
 - включен CPU throttling;
 - недостаточный CPU (например, `cpu=1`);
 - отсутствует `min-instances=1` (холодные старты).
+
+### Ошибка "Cannot decode RAW (libraw/dcraw)" при обработке DNG/RAW
+
+Если конвертация падает с 422 ошибкой для DNG или других RAW форматов:
+
+1. **Проверьте наличие инструментов в контейнере:**
+   ```bash
+   docker exec <container> sh -c "which dcraw_emu && which dcraw"
+   ```
+   Должны быть установлены оба: `dcraw_emu` (из `libraw-bin`) и `dcraw` (fallback).
+
+2. **Проверьте формат файла:**
+   Некоторые DNG файлы (особенно Apple ProRAW) могут требовать больше памяти или времени на обработку.
+   Убедитесь, что `MAX_FILE_MB` достаточно велик и контейнер имеет достаточно памяти.
+
+3. **Логи декодирования:**
+   Converter логирует все ошибки в stderr. Проверьте Cloud Run логи для деталей:
+   ```bash
+   gcloud run services logs read photo-converter --region="${GCP_REGION}" --limit=50
+   ```
+
+4. **Тестирование локально:**
+   ```bash
+   cd converter
+   docker build -t converter-test .
+   docker run -p 8080:8080 -e CONVERTER_API_KEY=test converter-test
+   # В другом терминале:
+   curl -F "file=@test.dng" -F "quality=92" -H "X-API-KEY: test" \
+     http://localhost:8080/convert -o output.jpg
+   ```
 
 ---
 
