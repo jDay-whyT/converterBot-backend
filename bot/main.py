@@ -286,28 +286,34 @@ async def _main() -> None:
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    # Start health server with initialized bot reference
-    health_task = asyncio.create_task(run_health_server(health_host, health_port, app))
-    await asyncio.sleep(0.5)  # Give health server a moment to start listening
-    logging.info("Health server started")
-
-    # Start bot polling
-    polling_task = asyncio.create_task(app.run())
-    logging.info("Bot polling started")
+    # Initialize task references
+    health_task = None
+    polling_task = None
 
     try:
+        # Start health server with initialized bot reference
+        health_task = asyncio.create_task(run_health_server(health_host, health_port, app))
+        await asyncio.sleep(0.5)  # Give health server a moment to start listening
+        logging.info("Health server started")
+
+        # Start bot polling
+        polling_task = asyncio.create_task(app.run())
+        logging.info("Bot polling started")
+
         # Wait for shutdown signal
         await shutdown_event.wait()
         logging.info("Shutdown signal received, stopping services")
     except Exception as exc:
         logging.error(f"Error in main loop: {exc}", exc_info=True)
     finally:
-        # Cancel tasks
-        polling_task.cancel()
-        health_task.cancel()
+        # Cancel and gather only existing tasks
+        tasks = [t for t in [health_task, polling_task] if t is not None]
+        for task in tasks:
+            task.cancel()
 
         # Wait for tasks to complete cancellation
-        await asyncio.gather(health_task, polling_task, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         # Cleanup resources in proper order
         await app.stop()  # Close httpx client
