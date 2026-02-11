@@ -24,24 +24,31 @@ SUPPORTED_EXTENSIONS = {".heic", ".dng", ".webp", ".tif", ".tiff"}
 class ConverterClient:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self._client = httpx.AsyncClient(timeout=settings.conversion_timeout_seconds)
 
     async def convert(self, path: Path, quality: int = 92, max_side: int | None = None) -> bytes:
         files = {"file": (path.name, path.read_bytes(), "application/octet-stream")}
         data: dict[str, str | int] = {"quality": quality}
         if max_side:
             data["max_side"] = max_side
-        response = await self._client.post(
-            f"{self.settings.converter_url}/convert",
-            headers={"X-API-KEY": self.settings.converter_api_key},
-            files=files,
-            data=data,
-        )
-        response.raise_for_status()
-        return response.content
 
-    async def close(self) -> None:
-        await self._client.aclose()
+        # Create AsyncClient for each conversion to avoid "Connector is closed" errors
+        async with httpx.AsyncClient(timeout=self.settings.conversion_timeout_seconds) as client:
+            response = await client.post(
+                f"{self.settings.converter_url}/convert",
+                headers={"X-API-KEY": self.settings.converter_api_key},
+                files=files,
+                data=data,
+            )
+            response.raise_for_status()
+
+            # Validate response content size
+            content_size = len(response.content)
+            logging.info(f"Converted {path.name}: received {content_size} bytes")
+
+            if content_size < 100:
+                raise ValueError(f"Converted file too small: {content_size} bytes (expected at least 100)")
+
+            return response.content
 
 
 class ConversionBot:
@@ -103,7 +110,14 @@ class ConversionBot:
         async with self.semaphore:
             try:
                 jpg_bytes = await self._download_and_convert(message)
+
+                # Validate jpg_bytes before sending
+                if not jpg_bytes or len(jpg_bytes) < 100:
+                    raise ValueError(f"Invalid jpg data: {len(jpg_bytes) if jpg_bytes else 0} bytes")
+
                 target_name = f"{Path(document.file_name or 'file').stem}.jpg"
+                logging.info(f"Sending {target_name} to Telegram: {len(jpg_bytes)} bytes")
+
                 await self.bot.send_document(
                     chat_id=self.settings.chat_id,
                     message_thread_id=self.settings.topic_converted_id,
@@ -269,7 +283,6 @@ async def _main() -> None:
         await asyncio.gather(health_task, polling_task, return_exceptions=True)
 
         # Cleanup resources
-        await app.converter.close()
         await app.bot.session.close()
 
         logging.info("Graceful shutdown complete")
