@@ -5,7 +5,8 @@
 1. **`photo-converter`** — HTTP API `POST /convert` (FastAPI + ImageMagick/dcraw).
    - **RAW поддержка** через LibRaw (`dcraw_emu`) с fallback на `dcraw`:
      - **DNG** (включая Apple ProRAW), CR2, CR3, NEF, NRW, ARW, RAF, RW2, ORF, PEF, SRW, X3F, 3FR, IIQ, DCR, KDC, MRW
-     - Установлены `libraw-bin` (содержит `dcraw_emu`) и `dcraw` для максимальной совместимости
+     - LibRaw 0.21.2 собирается из исходников для максимальной совместимости с ProRAW
+     - Fallback на `dcraw` для базовых RAW форматов
    - **HEIF/HEIC поддержка** через `libheif` (`.heic`, `.heif`)
 2. **`photo-convert-bot`** — Telegram-бот на aiogram (polling), который отправляет файлы в converter и публикует JPG в целевой топик.
 
