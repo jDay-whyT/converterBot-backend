@@ -25,30 +25,30 @@ class ConverterClient:
     def __init__(self, settings: Settings):
         self.settings = settings
 
-    async def convert(self, path: Path, quality: int = 92, max_side: int | None = None) -> bytes:
+    async def convert(
+        self, path: Path, client: httpx.AsyncClient, quality: int = 92, max_side: int | None = None
+    ) -> bytes:
         files = {"file": (path.name, path.read_bytes(), "application/octet-stream")}
         data: dict[str, str | int] = {"quality": quality}
         if max_side:
             data["max_side"] = max_side
 
-        # Create AsyncClient for each conversion to avoid "Connector is closed" errors
-        async with httpx.AsyncClient(timeout=self.settings.conversion_timeout_seconds) as client:
-            response = await client.post(
-                f"{self.settings.converter_url}/convert",
-                headers={"X-API-KEY": self.settings.converter_api_key},
-                files=files,
-                data=data,
-            )
-            response.raise_for_status()
+        response = await client.post(
+            f"{self.settings.converter_url}/convert",
+            headers={"X-API-KEY": self.settings.converter_api_key},
+            files=files,
+            data=data,
+        )
+        response.raise_for_status()
 
-            # Validate response content size
-            content_size = len(response.content)
-            logging.info(f"Converted {path.name}: received {content_size} bytes")
+        # Validate response content size
+        content_size = len(response.content)
+        logging.info(f"Converted {path.name}: received {content_size} bytes")
 
-            if content_size < 100:
-                raise ValueError(f"Converted file too small: {content_size} bytes (expected at least 100)")
+        if content_size < 100:
+            raise ValueError(f"Converted file too small: {content_size} bytes (expected at least 100)")
 
-            return response.content
+        return response.content
 
 
 class ConversionBot:
@@ -59,11 +59,32 @@ class ConversionBot:
         self.registry = BatchRegistry(settings.batch_window_seconds)
         self.converter = ConverterClient(settings)
         self.semaphore = asyncio.Semaphore(2)
+        self._http_client: httpx.AsyncClient | None = None
         self._bind_handlers()
 
     def _bind_handlers(self) -> None:
         self.dp.message.register(self._start, Command("start"))
         self.dp.message.register(self._handle_document, F.document)
+
+    async def start(self) -> None:
+        """Initialize resources before starting the bot."""
+        logging.info("Initializing httpx.AsyncClient with connection pooling")
+        self._http_client = httpx.AsyncClient(
+            timeout=self.settings.conversion_timeout_seconds,
+            limits=httpx.Limits(
+                max_connections=50,  # Maximum total connections
+                max_keepalive_connections=20,  # Keep-alive pool size
+            ),
+        )
+        logging.info("httpx.AsyncClient initialized successfully")
+
+    async def stop(self) -> None:
+        """Cleanup resources during graceful shutdown."""
+        if self._http_client is not None:
+            logging.info("Closing httpx.AsyncClient")
+            await self._http_client.aclose()
+            self._http_client = None
+            logging.info("httpx.AsyncClient closed successfully")
 
     async def _start(self, message: Message) -> None:
         if not self._is_allowed_user(message):
@@ -132,11 +153,14 @@ class ConversionBot:
 
     async def _download_and_convert(self, message: Message) -> bytes:
         assert message.document
+        if self._http_client is None:
+            raise RuntimeError("httpx.AsyncClient not initialized. Call start() before processing documents.")
+
         with tempfile.TemporaryDirectory(prefix="tg-file-") as tmpdir:
             source = Path(tmpdir) / (message.document.file_name or "input.bin")
             file_info = await self.bot.get_file(message.document.file_id)
             await self.bot.download_file(file_info.file_path, destination=source)
-            return await self.converter.convert(source, quality=self.settings.conversion_quality)
+            return await self.converter.convert(source, self._http_client, quality=self.settings.conversion_quality)
 
     async def _register_result(self, batch: BatchProgress, ok: bool, file_name: str, reason: str | None) -> None:
         async with batch.lock:
@@ -245,6 +269,9 @@ async def _main() -> None:
     app = ConversionBot(settings)
     logging.info("Bot initialized successfully")
 
+    # Initialize httpx client and other resources
+    await app.start()
+
     # Cloud Run health server config - start AFTER bot is ready
     health_host = "0.0.0.0"
     health_port = int(os.getenv("PORT", "8080"))
@@ -283,6 +310,7 @@ async def _main() -> None:
         await asyncio.gather(health_task, polling_task, return_exceptions=True)
 
         # Cleanup resources
+        await app.stop()  # Close httpx client
         await app.bot.session.close()
 
         logging.info("Graceful shutdown complete")
