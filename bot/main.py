@@ -13,9 +13,6 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, Message
-from google.auth.transport.requests import Request
-from google.oauth2 import service_account
-import google.auth
 
 from batching import BatchProgress, BatchRegistry
 from config import Settings, load_settings
@@ -27,42 +24,6 @@ SUPPORTED_EXTENSIONS = {".heic", ".dng", ".webp", ".tif", ".tiff"}
 class ConverterClient:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self._credentials = None
-        self._id_token = None
-        self._token_expiry = None
-
-    def _get_id_token(self) -> str | None:
-        """Get Google Cloud ID token for authenticating to Cloud Run services."""
-        try:
-            # Check if we need to refresh the token
-            import datetime
-            if self._id_token and self._token_expiry:
-                if datetime.datetime.now(datetime.timezone.utc) < self._token_expiry:
-                    return self._id_token
-
-            # Try to get credentials from the environment (works in Cloud Run, GCE, etc.)
-            credentials, project = google.auth.default()
-
-            # If we're running on GCP with default credentials, get an ID token
-            if credentials:
-                # Request an ID token for the converter service URL
-                from google.auth.transport.requests import Request as AuthRequest
-                from google.oauth2 import id_token
-
-                # Get ID token for the target audience (converter URL)
-                token = id_token.fetch_id_token(AuthRequest(), self.settings.converter_url)
-
-                # Cache the token (typically valid for 1 hour, refresh 5 min before expiry)
-                self._id_token = token
-                self._token_expiry = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=55)
-
-                logging.info("Successfully obtained ID token for Cloud Run authentication")
-                return token
-        except Exception as exc:
-            # If we can't get an ID token, log it but continue (service might be --allow-unauthenticated)
-            logging.warning(f"Could not obtain ID token (service might be public): {exc}")
-
-        return None
 
     async def convert(
         self, path: Path, client: httpx.AsyncClient, quality: int = 92, max_side: int | None = None
@@ -72,13 +33,8 @@ class ConverterClient:
         if max_side:
             data["max_side"] = max_side
 
-        # Build headers with both API key and ID token (if available)
+        # Build headers with API key
         headers = {"X-API-KEY": self.settings.converter_api_key}
-
-        # Add ID token for Cloud Run authentication if available
-        id_token = self._get_id_token()
-        if id_token:
-            headers["Authorization"] = f"Bearer {id_token}"
 
         response = await client.post(
             f"{self.settings.converter_url}/convert",

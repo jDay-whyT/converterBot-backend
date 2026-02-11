@@ -4,10 +4,9 @@ This document explains the authentication mechanisms in the photo converter bot 
 
 ## Overview
 
-The system uses a **dual-layer authentication** approach for maximum security:
+The system uses **API Key authentication** for securing access to the converter service:
 
-1. **Cloud Run IAM Authentication** (Optional) - Service-to-service authentication using ID tokens
-2. **Application-level API Key** (Required) - Custom API key validation
+- **Application-level API Key** (Required) - Custom API key validation via X-API-KEY header
 
 ## Authentication Flow
 
@@ -22,81 +21,10 @@ The system uses a **dual-layer authentication** approach for maximum security:
                                             │                                       │
                                             │                                       │
                                     Auth Headers:                         Validates:
-                                    • X-API-KEY                           • ID Token (if required)
-                                    • Authorization: Bearer <ID_TOKEN>    • X-API-KEY
+                                    • X-API-KEY                           • X-API-KEY
 ```
 
-## Layer 1: Cloud Run IAM Authentication (Optional)
-
-### How It Works
-
-When the converter service is deployed with authentication required (default Cloud Run behavior):
-
-- Cloud Run verifies the caller's identity using Google Cloud ID tokens
-- The bot automatically obtains ID tokens using Application Default Credentials (ADC)
-- ID tokens are cached for 55 minutes and refreshed automatically
-- If ID token cannot be obtained, the bot falls back to API key only (for `--allow-unauthenticated` services)
-
-### Implementation
-
-The bot's `ConverterClient` class handles ID token management:
-
-```python
-def _get_id_token(self) -> str | None:
-    """Get Google Cloud ID token for authenticating to Cloud Run services."""
-    # Uses google.auth library to obtain ID tokens
-    # Caches tokens for 55 minutes
-    # Falls back gracefully if not running on GCP
-```
-
-### Configuration Options
-
-#### Option 1: Public Converter (Simpler)
-
-Deploy converter without authentication requirement:
-
-```bash
-gcloud run services update photo-converter \
-  --region=us-central1 \
-  --allow-unauthenticated
-```
-
-**Pros:**
-- Simpler setup
-- No IAM configuration needed
-- Still protected by API key
-
-**Cons:**
-- Anyone with the URL + API key can access
-- No GCP identity-based access control
-
-#### Option 2: Private Converter (More Secure)
-
-Keep authentication enabled and grant bot access:
-
-```bash
-# Get bot service account
-BOT_SA=$(gcloud run services describe photo-convert-bot \
-  --region=us-central1 \
-  --format="value(spec.template.spec.serviceAccountName)")
-
-# Grant run.invoker role
-gcloud run services add-iam-policy-binding photo-converter \
-  --region=us-central1 \
-  --member="serviceAccount:${BOT_SA}" \
-  --role="roles/run.invoker"
-```
-
-**Pros:**
-- Defense in depth (two authentication layers)
-- GCP-native access control
-- Audit logs for service-to-service calls
-
-**Cons:**
-- Requires IAM configuration
-- More complex troubleshooting
-
-## Layer 2: Application-level API Key (Required)
+## API Key Authentication
 
 ### How It Works
 
@@ -119,6 +47,39 @@ gcloud run services add-iam-policy-binding photo-converter \
 
 3. **Deploy:** Workflow automatically sets the key for both services
 
+### Deployment Options
+
+#### Option 1: Public Converter (Recommended)
+
+Deploy converter without Cloud Run authentication requirement:
+
+```bash
+gcloud run services update photo-converter \
+  --region=us-central1 \
+  --allow-unauthenticated
+```
+
+**Pros:**
+- Simpler setup
+- No IAM configuration needed
+- Protected by API key
+
+**Cons:**
+- Anyone with the URL + API key can access
+- No GCP identity-based access control
+
+#### Option 2: Private Converter
+
+Keep Cloud Run authentication enabled:
+
+```bash
+gcloud run services update photo-converter \
+  --region=us-central1 \
+  --no-allow-unauthenticated
+```
+
+**Note:** This requires additional IAM configuration for bot service account access.
+
 ### Security Best Practices
 
 - Use a cryptographically random key (minimum 32 bytes)
@@ -127,49 +88,6 @@ gcloud run services add-iam-policy-binding photo-converter \
 - Store in GitHub Secrets, not Variables
 
 ## Troubleshooting
-
-### 403 Forbidden Error
-
-**Symptoms:**
-```
-httpx.HTTPStatusError: 403 Forbidden
-```
-
-**Diagnosis:**
-
-1. **Check converter authentication setting:**
-   ```bash
-   gcloud run services describe photo-converter \
-     --region=us-central1 \
-     --format="value(status.conditions[0].message)"
-   ```
-
-2. **Check bot logs for ID token status:**
-   ```bash
-   gcloud logs read --service=photo-convert-bot --limit=50 | grep "ID token"
-   ```
-
-   Expected messages:
-   - Success: `Successfully obtained ID token for Cloud Run authentication`
-   - Fallback: `Could not obtain ID token (service might be public)`
-
-3. **Verify IAM permissions (if using Option 2):**
-   ```bash
-   gcloud run services get-iam-policy photo-converter --region=us-central1
-   ```
-
-   Should show:
-   ```yaml
-   members:
-   - serviceAccount:bot-service-account@project.iam.gserviceaccount.com
-   role: roles/run.invoker
-   ```
-
-**Solutions:**
-
-- **For 403 with "Connector is closed"**: httpx client lifecycle issue (should not happen with current code)
-- **For 403 with no ID token**: Use Option 1 (allow unauthenticated) or fix IAM permissions
-- **For 403 with invalid API key**: Check `CONVERTER_API_KEY` matches in both services
 
 ### 401 Unauthorized Error
 
@@ -201,6 +119,38 @@ Keys must match. Redeploy if they don't:
 ```bash
 gh workflow run deploy-photo-converter-bot.yml
 ```
+
+### 403 Forbidden Error
+
+**Symptoms:**
+```
+httpx.HTTPStatusError: 403 Forbidden
+```
+
+**Diagnosis:**
+
+1. **Check converter authentication setting:**
+   ```bash
+   gcloud run services describe photo-converter \
+     --region=us-central1 \
+     --format="value(metadata.annotations)"
+   ```
+
+2. **Verify service is public:**
+   ```bash
+   gcloud run services get-iam-policy photo-converter --region=us-central1
+   ```
+
+   For public access, should show:
+   ```yaml
+   members:
+   - allUsers
+   role: roles/run.invoker
+   ```
+
+**Solution:**
+
+Use `--allow-unauthenticated` deployment option (Option 1 above).
 
 ### Environment Variable Issues
 
@@ -243,15 +193,13 @@ logging.info("Configuration loaded successfully")
 
 - [ ] Use strong random API keys (minimum 32 bytes)
 - [ ] Rotate API keys periodically
-- [ ] Use `--no-allow-unauthenticated` for converter (Option 2) in production
-- [ ] Grant minimal IAM permissions (run.invoker only)
-- [ ] Monitor Cloud Logging for unauthorized access attempts
 - [ ] Keep `ALLOWED_EDITORS` list minimal and up-to-date
 - [ ] Use Cloud Run ingress controls if needed:
   ```bash
   gcloud run services update photo-converter \
     --ingress=internal  # Only accessible from same project
   ```
+- [ ] Monitor Cloud Logging for unauthorized access attempts
 
 ## Testing Authentication
 
@@ -263,18 +211,9 @@ CONVERTER_URL=$(gcloud run services describe photo-converter \
   --region=us-central1 \
   --format="value(status.url)")
 
-# Test with API key only (works with --allow-unauthenticated)
+# Test with API key
 curl -X POST "${CONVERTER_URL}/convert" \
   -H "X-API-Key: ${CONVERTER_API_KEY}" \
-  -F "file=@test-image.heic" \
-  -F "quality=92" \
-  -o output.jpg
-
-# Test with ID token (required without --allow-unauthenticated)
-ID_TOKEN=$(gcloud auth print-identity-token)
-curl -X POST "${CONVERTER_URL}/convert" \
-  -H "X-API-Key: ${CONVERTER_API_KEY}" \
-  -H "Authorization: Bearer ${ID_TOKEN}" \
   -F "file=@test-image.heic" \
   -F "quality=92" \
   -o output.jpg
@@ -287,15 +226,9 @@ curl -X POST "${CONVERTER_URL}/convert" \
 gcloud logs read --service=photo-converter \
   --filter='httpRequest.status=401 OR httpRequest.status=403' \
   --limit=50
-
-# View ID token acquisition logs
-gcloud logs read --service=photo-convert-bot \
-  --filter='textPayload:"ID token"' \
-  --limit=20
 ```
 
 ## References
 
 - [Cloud Run Authentication](https://cloud.google.com/run/docs/authenticating/service-to-service)
-- [Google Auth Python Library](https://google-auth.readthedocs.io/)
 - [Cloud Run IAM Roles](https://cloud.google.com/run/docs/reference/iam/roles)
