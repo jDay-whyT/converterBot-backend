@@ -310,7 +310,6 @@ async def _main() -> None:
         await asyncio.gather(health_task, polling_task, return_exceptions=True)
 
         # Cleanup resources in proper order
-        await app.dp.stop()  # Stop dispatcher first
         await app.stop()  # Close httpx client
         await app.bot.session.close()  # Close bot session last
 
