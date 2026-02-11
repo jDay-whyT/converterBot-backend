@@ -76,7 +76,7 @@ gcloud run deploy converter-bot \
   --set-env-vars CONVERTER_API_KEY=<SECRET>,MAX_FILE_MB=40
 ```
 
-> Рекомендуется ограничить вызовы по сети/VPC/IAM, даже при API key.
+> Converter Cloud Run публичный (IAM `allUsers` + `roles/run.invoker`). Защита запросов выполняется только через `CONVERTER_API_KEY` в заголовке `X-API-KEY`.
 
 ---
 

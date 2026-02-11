@@ -141,34 +141,12 @@ gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
 
 ### Bot Gets 403 Error When Calling Converter
 
-**Cause:** Cloud Run converter service requires authentication but bot doesn't have proper permissions
+**Cause:** `CONVERTER_API_KEY` value mismatch between bot and converter, or missing `X-API-KEY` header.
 
-**Fix Options:**
-
-**Option 1: Public converter (simpler)**
-```bash
-gcloud run services update "${CLOUD_RUN_CONVERTER_SERVICE}" \
-  --region="${REGION}" \
-  --allow-unauthenticated
-```
-
-**Option 2: Private converter with IAM (more secure)**
-1. Keep converter with authentication enabled
-2. Grant bot service account access to invoke converter:
-```bash
-# Get the bot service account
-BOT_SA=$(gcloud run services describe "${CLOUD_RUN_BOT_SERVICE}" \
-  --region="${REGION}" \
-  --format="value(spec.template.spec.serviceAccountName)")
-
-# Grant run.invoker role to bot service account for converter service
-gcloud run services add-iam-policy-binding "${CLOUD_RUN_CONVERTER_SERVICE}" \
-  --region="${REGION}" \
-  --member="serviceAccount:${BOT_SA}" \
-  --role="roles/run.invoker"
-```
-
-**Note:** The bot now automatically includes ID tokens when calling the converter, so both options work seamlessly.
+**Fix:**
+1. Ensure converter Cloud Run service is public (`allUsers` has `roles/run.invoker`).
+2. Ensure both services use the same `CONVERTER_API_KEY` value.
+3. Verify requests are sent to `POST ${CONVERTER_URL}/convert` with `X-API-KEY` header only.
 
 ### ALLOWED_EDITORS Format Issues
 
@@ -224,7 +202,7 @@ gcloud run services describe photo-convert-bot --region="${REGION}" --format="va
 # Test converter endpoint
 CONVERTER_URL=$(gcloud run services describe photo-converter --region="${REGION}" --format="value(status.url)")
 curl -X POST "${CONVERTER_URL}/convert" \
-  -H "X-API-Key: YOUR_CONVERTER_API_KEY" \
+  -H "X-API-KEY: YOUR_CONVERTER_API_KEY" \
   -F "file=@test-image.jpg"
 ```
 
