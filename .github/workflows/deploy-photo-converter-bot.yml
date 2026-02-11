@@ -16,8 +16,6 @@ jobs:
   deploy_converter:
     name: Deploy converter
     runs-on: ubuntu-latest
-    outputs:
-      converter_url: ${{ steps.export_converter_url.outputs.converter_url }}
 
     steps:
       - name: Checkout
@@ -193,24 +191,6 @@ jobs:
           env_vars: |
             CONVERTER_API_KEY=${{ secrets.CONVERTER_API_KEY }}
             MAX_FILE_MB=${{ vars.MAX_FILE_MB || '40' }}
-
-      - name: Export converter URL
-        id: export_converter_url
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          converter_url="$(gcloud run services describe "${{ secrets.CLOUD_RUN_CONVERTER_SERVICE }}" \
-            --region="${{ secrets.GCP_REGION }}" \
-            --project="${{ secrets.GCP_PROJECT }}" \
-            --format='value(status.url)')"
-
-          if [[ -z "$converter_url" ]]; then
-            echo "Failed to resolve converter URL" >&2
-            exit 1
-          fi
-
-          echo "converter_url=$converter_url" >> "$GITHUB_OUTPUT"
 
   deploy_bot:
     name: Deploy bot
@@ -391,6 +371,25 @@ jobs:
 
           echo "image_uri=$image_uri" >> "$GITHUB_OUTPUT"
 
+      - name: Get converter URL
+        id: get_converter_url
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          converter_url="$(gcloud run services describe "${{ secrets.CLOUD_RUN_CONVERTER_SERVICE }}" \
+            --region="${{ secrets.GCP_REGION }}" \
+            --project="${{ secrets.GCP_PROJECT }}" \
+            --format='value(status.url)')"
+
+          if [[ -z "$converter_url" ]]; then
+            echo "Failed to resolve converter URL" >&2
+            exit 1
+          fi
+
+          echo "Converter URL: $converter_url"
+          echo "converter_url=$converter_url" >> "$GITHUB_OUTPUT"
+
       - name: Deploy bot to Cloud Run
         id: deploy_bot
         uses: google-github-actions/deploy-cloudrun@v2
@@ -404,7 +403,7 @@ jobs:
             CHAT_ID=${{ vars.CHAT_ID }}
             TOPIC_SOURCE_ID=${{ vars.TOPIC_SOURCE_ID }}
             TOPIC_CONVERTED_ID=${{ vars.TOPIC_CONVERTED_ID }}
-            CONVERTER_URL=${{ needs.deploy_converter.outputs.converter_url }}
+            CONVERTER_URL=${{ steps.get_converter_url.outputs.converter_url }}
             CONVERTER_API_KEY=${{ secrets.CONVERTER_API_KEY }}
             MAX_FILE_MB=${{ vars.MAX_FILE_MB || '40' }}
             BATCH_WINDOW_SECONDS=${{ vars.BATCH_WINDOW_SECONDS }}
