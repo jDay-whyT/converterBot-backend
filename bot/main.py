@@ -11,13 +11,12 @@ from pathlib import Path
 import httpx
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, Message
 
 from batching import BatchProgress, BatchRegistry
 from config import Settings, load_settings
-from progress_utils import is_message_not_modified_error
+from telegram_retry import ProgressDebouncer, TelegramFileSemaphore, telegram_api_retry
 
 SUPPORTED_EXTENSIONS = {".heic", ".dng", ".webp", ".tif", ".tiff"}
 
@@ -76,6 +75,8 @@ class ConversionBot:
         self.registry = BatchRegistry(settings.batch_window_seconds)
         self.converter = ConverterClient(settings)
         self.semaphore = asyncio.Semaphore(2)
+        self.file_semaphore = TelegramFileSemaphore()
+        self.progress_debouncer = ProgressDebouncer(min_interval=3.0, min_files=3)
         self._http_client: httpx.AsyncClient | None = None
         self._bind_handlers()
 
@@ -164,10 +165,19 @@ class ConversionBot:
 
                 with tempfile.TemporaryDirectory(prefix="tg-file-") as tmpdir:
                     source = Path(tmpdir) / (document.file_name or "input.bin")
-                    file_info = await self.bot.get_file(document.file_id)
+                    file_info = await telegram_api_retry(
+                        self.bot.get_file,
+                        document.file_id,
+                        max_retries=2,
+                    )
 
                     download_started = perf_counter()
-                    await self.bot.download_file(file_info.file_path, destination=source)
+                    await telegram_api_retry(
+                        self.bot.download_file,
+                        file_info.file_path,
+                        destination=source,
+                        max_retries=2,
+                    )
                     tg_download_s = perf_counter() - download_started
                     in_bytes = source.stat().st_size
 
@@ -188,11 +198,14 @@ class ConversionBot:
                 logging.info(f"Sending {target_name} to Telegram: {len(jpg_bytes)} bytes")
 
                 upload_started = perf_counter()
-                await self.bot.send_document(
-                    chat_id=self.settings.chat_id,
-                    message_thread_id=self.settings.topic_converted_id,
-                    document=BufferedInputFile(jpg_bytes, filename=target_name),
-                )
+                async with self.file_semaphore:
+                    await telegram_api_retry(
+                        self.bot.send_document,
+                        chat_id=self.settings.chat_id,
+                        message_thread_id=self.settings.topic_converted_id,
+                        document=BufferedInputFile(jpg_bytes, filename=target_name),
+                        max_retries=2,
+                    )
                 tg_upload_s = perf_counter() - upload_started
                 await self._register_result(batch, True, document.file_name or "file", None)
             except httpx.HTTPStatusError as exc:
@@ -235,14 +248,22 @@ class ConversionBot:
                 if reason:
                     batch.errors.append(f"ошибка на файле {file_name} ({reason})")
 
-            needs_update = (
-                batch.processed == 1
-                or batch.processed == batch.total
-                or batch.processed % max(1, self.settings.progress_update_every) == 0
-                or (not ok)
+            # Use progress debouncer to avoid spamming Telegram API
+            batch_id = id(batch)
+            current_time = perf_counter()
+            needs_update = self.progress_debouncer.should_update(
+                batch_id=batch_id,
+                processed=batch.processed,
+                total=batch.total,
+                has_error=not ok,
+                current_time=current_time,
             )
             if needs_update:
                 await self._update_progress(batch)
+
+            # Clean up debouncer state when batch is complete
+            if batch.processed == batch.total:
+                self.progress_debouncer.reset(batch_id)
 
     async def _update_progress(self, batch: BatchProgress) -> None:
         text_lines = [
@@ -256,23 +277,24 @@ class ConversionBot:
         text = "\n".join(text_lines)
 
         if batch.progress_message_id is None:
-            sent = await self.bot.send_message(
+            sent = await telegram_api_retry(
+                self.bot.send_message,
                 chat_id=batch.chat_id,
                 message_thread_id=batch.topic_id,
                 text=text,
+                max_retries=2,
             )
             batch.progress_message_id = sent.message_id
             return
 
-        try:
-            await self.bot.edit_message_text(
-                chat_id=batch.chat_id,
-                message_id=batch.progress_message_id,
-                text=text,
-            )
-        except TelegramBadRequest as exc:
-            if not is_message_not_modified_error(exc):
-                raise
+        await telegram_api_retry(
+            self.bot.edit_message_text,
+            chat_id=batch.chat_id,
+            message_id=batch.progress_message_id,
+            text=text,
+            max_retries=2,
+            ignore_message_not_modified=True,
+        )
 
     async def run(self) -> None:
         await self.dp.start_polling(self.bot)
