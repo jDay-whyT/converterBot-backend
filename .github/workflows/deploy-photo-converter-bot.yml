@@ -188,10 +188,8 @@ jobs:
           service: ${{ secrets.CLOUD_RUN_CONVERTER_SERVICE }}
           region: ${{ secrets.GCP_REGION }}
           image: ${{ steps.build_push_converter.outputs.image_uri }}
-          # Note: Converter authentication can be configured in two ways:
-          # 1. --allow-unauthenticated (simpler): Anyone with the URL + API key can access
-          # 2. --no-allow-unauthenticated (more secure): Requires ID token + API key
-          #    If using option 2, grant the bot service account "roles/run.invoker" on this service
+          # Note: Deploy converter with --allow-unauthenticated
+          # Authentication is handled by X-API-KEY header only
           env_vars: |
             CONVERTER_API_KEY=${{ secrets.CONVERTER_API_KEY }}
             MAX_FILE_MB=${{ vars.MAX_FILE_MB || '40' }}

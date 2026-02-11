@@ -141,34 +141,14 @@ gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
 
 ### Bot Gets 403 Error When Calling Converter
 
-**Cause:** Cloud Run converter service requires authentication but bot doesn't have proper permissions
+**Cause:** Cloud Run converter service requires authentication
 
-**Fix Options:**
-
-**Option 1: Public converter (simpler)**
+**Fix:** Deploy converter with `--allow-unauthenticated` (authentication is handled by X-API-KEY header):
 ```bash
 gcloud run services update "${CLOUD_RUN_CONVERTER_SERVICE}" \
   --region="${REGION}" \
   --allow-unauthenticated
 ```
-
-**Option 2: Private converter with IAM (more secure)**
-1. Keep converter with authentication enabled
-2. Grant bot service account access to invoke converter:
-```bash
-# Get the bot service account
-BOT_SA=$(gcloud run services describe "${CLOUD_RUN_BOT_SERVICE}" \
-  --region="${REGION}" \
-  --format="value(spec.template.spec.serviceAccountName)")
-
-# Grant run.invoker role to bot service account for converter service
-gcloud run services add-iam-policy-binding "${CLOUD_RUN_CONVERTER_SERVICE}" \
-  --region="${REGION}" \
-  --member="serviceAccount:${BOT_SA}" \
-  --role="roles/run.invoker"
-```
-
-**Note:** The bot now automatically includes ID tokens when calling the converter, so both options work seamlessly.
 
 ### ALLOWED_EDITORS Format Issues
 
