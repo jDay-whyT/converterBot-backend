@@ -232,6 +232,10 @@ jobs:
           CONVERTER_API_KEY: ${{ secrets.CONVERTER_API_KEY }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ALLOWED_EDITORS: ${{ vars.ALLOWED_EDITORS }}
+          CHAT_ID: ${{ vars.CHAT_ID }}
+          TOPIC_SOURCE_ID: ${{ vars.TOPIC_SOURCE_ID }}
+          TOPIC_CONVERTED_ID: ${{ vars.TOPIC_CONVERTED_ID }}
         run: |
           set -euo pipefail
 
@@ -242,11 +246,15 @@ jobs:
             GCP_REGION
             CLOUD_RUN_BOT_SERVICE
             CONVERTER_API_KEY
+            ALLOWED_EDITORS
+            CHAT_ID
+            TOPIC_SOURCE_ID
+            TOPIC_CONVERTED_ID
           )
 
           for key in "${required[@]}"; do
             if [[ -z "${!key:-}" ]]; then
-              echo "Missing required secret: $key" >&2
+              echo "Missing required secret or variable: $key" >&2
               exit 1
             fi
           done

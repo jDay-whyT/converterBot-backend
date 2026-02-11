@@ -184,12 +184,17 @@ async def handle_root(request: web.Request) -> web.Response:
 
 async def handle_healthz(request: web.Request) -> web.Response:
     """Detailed health check endpoint."""
-    return web.json_response({"ok": True})
+    bot_app = request.app.get("bot_app")
+    return web.json_response({
+        "ok": True,
+        "bot_ready": bot_app is not None,
+    })
 
 
 async def run_health_server(host: str, port: int) -> None:
     """Run HTTP health check server for Cloud Run."""
     app = web.Application()
+    app["bot_app"] = None  # Will be set to True when bot starts successfully
     app.router.add_get("/", handle_root)
     app.router.add_get("/healthz", handle_healthz)
 
@@ -209,10 +214,8 @@ async def run_health_server(host: str, port: int) -> None:
 
 async def _main() -> None:
     logging.basicConfig(level=logging.INFO)
-    settings = load_settings()
-    app = ConversionBot(settings)
 
-    # Cloud Run health server config
+    # Cloud Run health server config - start this FIRST before loading settings
     health_host = "0.0.0.0"
     health_port = int(os.getenv("PORT", "8080"))
 
@@ -226,27 +229,51 @@ async def _main() -> None:
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    # Create tasks for parallel execution
-    polling_task = asyncio.create_task(app.run())
+    # Start health server immediately so Cloud Run can see we're alive
     health_task = asyncio.create_task(run_health_server(health_host, health_port))
+    # Give health server a moment to start listening
+    await asyncio.sleep(0.5)
+    logging.info("Health server started, loading configuration...")
+
+    # Now try to load settings and start bot
+    polling_task = None
+    app = None
 
     try:
+        settings = load_settings()
+        app = ConversionBot(settings)
+        logging.info("Configuration loaded successfully, starting bot...")
+
+        # Create bot polling task
+        polling_task = asyncio.create_task(app.run())
+
         # Wait for shutdown signal
         await shutdown_event.wait()
         logging.info("Shutdown signal received, stopping services")
+    except ValueError as exc:
+        logging.error(f"Configuration error: {exc}")
+        logging.error("Bot cannot start due to missing or invalid environment variables")
+        logging.error("Health server will continue running for Cloud Run")
+        # Keep health server running even if bot config is invalid
+        await shutdown_event.wait()
     except Exception as exc:
-        logging.error(f"Error in main loop: {exc}")
+        logging.error(f"Error in main loop: {exc}", exc_info=True)
     finally:
-        # Cancel both tasks
-        polling_task.cancel()
+        # Cancel tasks
+        if polling_task:
+            polling_task.cancel()
         health_task.cancel()
 
         # Wait for tasks to complete cancellation
-        await asyncio.gather(polling_task, health_task, return_exceptions=True)
+        tasks_to_wait = [health_task]
+        if polling_task:
+            tasks_to_wait.append(polling_task)
+        await asyncio.gather(*tasks_to_wait, return_exceptions=True)
 
-        # Cleanup resources
-        await app.converter.close()
-        await app.bot.session.close()
+        # Cleanup resources if app was initialized
+        if app:
+            await app.converter.close()
+            await app.bot.session.close()
 
         logging.info("Graceful shutdown complete")
 

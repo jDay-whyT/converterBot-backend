@@ -6,7 +6,10 @@ from dataclasses import dataclass
 def _required(name: str) -> str:
     value = os.getenv(name)
     if not value:
-        raise ValueError(f"Missing required env var: {name}")
+        raise ValueError(
+            f"Missing required environment variable: {name}\n"
+            f"Please ensure this variable is set in your deployment configuration."
+        )
     return value
 
 
@@ -34,9 +37,16 @@ def _parse_allowed(raw: str) -> set[int]:
 
 
 def load_settings() -> Settings:
+    allowed_editors = _parse_allowed(_required("ALLOWED_EDITORS"))
+    if not allowed_editors:
+        raise ValueError(
+            "ALLOWED_EDITORS must contain at least one user ID.\n"
+            "Format: comma, pipe, or space-separated user IDs (e.g., '123456789,987654321')"
+        )
+
     return Settings(
         bot_token=_required("BOT_TOKEN"),
-        allowed_editors=_parse_allowed(_required("ALLOWED_EDITORS")),
+        allowed_editors=allowed_editors,
         chat_id=int(_required("CHAT_ID")),
         topic_source_id=int(_required("TOPIC_SOURCE_ID")),
         topic_converted_id=int(_required("TOPIC_CONVERTED_ID")),
