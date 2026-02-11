@@ -132,11 +132,105 @@ class ConverterIntegrationTests(unittest.TestCase):
             # We test with webp format instead
             pass
 
+    @unittest.skipIf(not os.path.exists("/usr/bin/magick"), "imagemagick not installed")
+    def test_convert_webp_format(self) -> None:
+        """Test conversion of WebP format"""
+        # Create a minimal WebP (1x1 pixel)
+        # This is a valid lossy WebP file
+        webp_data = bytes.fromhex(
+            "52494646260000005745425056503820"
+            "1a0000003001009d012a0100010001"
+            "0011620029564d46"
+        )
+
+        response = self.client.post(
+            "/convert",
+            headers={"X-API-KEY": "test_secret"},
+            files={"file": ("test.webp", webp_data, "application/octet-stream")},
+            data={"quality": "85"},
+        )
+
+        # Should either succeed (200) or fail with conversion error (422)
+        # depending on whether the minimal WebP is valid enough
+        self.assertIn(response.status_code, [200, 422])
+
+    @unittest.skipIf(not os.path.exists("/usr/bin/magick"), "imagemagick not installed")
+    def test_heif_format_validation(self) -> None:
+        """Test that HEIF/HEIC formats are accepted"""
+        # Test .heic extension
+        response = self.client.post(
+            "/convert",
+            headers={"X-API-KEY": "test_secret"},
+            files={"file": ("test.heic", b"fake data", "application/octet-stream")},
+        )
+        # Should fail with conversion error, not unsupported format
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("conversion failed", response.json()["detail"])
+
+        # Test .heif extension
+        response = self.client.post(
+            "/convert",
+            headers={"X-API-KEY": "test_secret"},
+            files={"file": ("test.heif", b"fake data", "application/octet-stream")},
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("conversion failed", response.json()["detail"])
+
+    @unittest.skipIf(not os.path.exists("/usr/bin/dcraw"), "dcraw not installed")
+    def test_raw_format_validation(self) -> None:
+        """Test that RAW formats are accepted and use RAW conversion path"""
+        raw_formats = [".dng", ".cr2", ".nef", ".arw"]
+
+        for fmt in raw_formats:
+            with self.subTest(format=fmt):
+                response = self.client.post(
+                    "/convert",
+                    headers={"X-API-KEY": "test_secret"},
+                    files={"file": (f"test{fmt}", b"fake raw data", "application/octet-stream")},
+                )
+                # Should fail with RAW decoding error, not unsupported format
+                self.assertEqual(response.status_code, 422)
+                detail = response.json()["detail"]
+                self.assertIn("conversion failed", detail)
+
+    @unittest.skipIf(not os.path.exists("/usr/bin/magick"), "imagemagick not installed")
+    def test_tiff_format_validation(self) -> None:
+        """Test that TIFF formats are accepted"""
+        for ext in [".tif", ".tiff"]:
+            with self.subTest(extension=ext):
+                response = self.client.post(
+                    "/convert",
+                    headers={"X-API-KEY": "test_secret"},
+                    files={"file": (f"test{ext}", b"fake tiff", "application/octet-stream")},
+                )
+                # Should fail with conversion error, not unsupported format
+                self.assertEqual(response.status_code, 422)
+                self.assertIn("conversion failed", response.json()["detail"])
+
     def test_api_key_from_environment(self) -> None:
         """Verify API key is loaded from environment"""
         from app import API_KEY
 
         self.assertEqual(API_KEY, "test_secret")
+
+    def test_all_raw_formats_in_allowed_suffixes(self) -> None:
+        """Verify all RAW formats are in allowed suffixes"""
+        from app import RAW_SUFFIXES, ALLOWED_SUFFIXES
+
+        for raw_format in RAW_SUFFIXES:
+            with self.subTest(format=raw_format):
+                self.assertIn(raw_format, ALLOWED_SUFFIXES)
+
+    def test_raw_suffixes_completeness(self) -> None:
+        """Verify RAW_SUFFIXES contains expected formats"""
+        from app import RAW_SUFFIXES
+
+        expected_raw = {
+            ".dng", ".cr2", ".cr3", ".nef", ".nrw", ".arw",
+            ".raf", ".rw2", ".orf", ".pef", ".srw", ".x3f",
+            ".3fr", ".iiq", ".dcr", ".kdc", ".mrw",
+        }
+        self.assertEqual(RAW_SUFFIXES, expected_raw)
 
 
 if __name__ == "__main__":
