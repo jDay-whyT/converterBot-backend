@@ -32,6 +32,22 @@ class ConfigTests(unittest.TestCase):
         result = _parse_allowed("111,,333")
         self.assertEqual(result, {111, 333})
 
+    def test_parse_allowed_pipe_separator(self) -> None:
+        result = _parse_allowed("111|222|333")
+        self.assertEqual(result, {111, 222, 333})
+
+    def test_parse_allowed_pipe_with_spaces(self) -> None:
+        result = _parse_allowed("111 | 222 | 333")
+        self.assertEqual(result, {111, 222, 333})
+
+    def test_parse_allowed_mixed_separators(self) -> None:
+        result = _parse_allowed("111|222, 333 444")
+        self.assertEqual(result, {111, 222, 333, 444})
+
+    def test_parse_allowed_trailing_separator(self) -> None:
+        result = _parse_allowed("111|222|")
+        self.assertEqual(result, {111, 222})
+
     def test_load_settings_with_defaults(self) -> None:
         env = {
             "BOT_TOKEN": "test_token",

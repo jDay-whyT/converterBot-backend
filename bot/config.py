@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass
 
 
@@ -27,7 +28,9 @@ class Settings:
 
 
 def _parse_allowed(raw: str) -> set[int]:
-    return {int(item.strip()) for item in raw.split(",") if item.strip()}
+    """Parse ALLOWED_EDITORS from various formats: '|', ',', or whitespace-separated."""
+    items = re.split(r"[,\s|]+", raw.strip())
+    return {int(item) for item in items if item}
 
 
 def load_settings() -> Settings:
