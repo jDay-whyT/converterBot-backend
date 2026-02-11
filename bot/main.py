@@ -179,22 +179,24 @@ class ConversionBot:
 
 async def handle_root(request: web.Request) -> web.Response:
     """Health check endpoint for Cloud Run."""
+    bot_app = request.app.get("bot_app")
+    if bot_app is None:
+        return web.Response(status=503, text="bot not initialized")
     return web.Response(text="ok")
 
 
 async def handle_healthz(request: web.Request) -> web.Response:
     """Detailed health check endpoint."""
     bot_app = request.app.get("bot_app")
-    return web.json_response({
-        "ok": True,
-        "bot_ready": bot_app is not None,
-    })
+    if bot_app is None:
+        return web.json_response({"ok": False, "bot_ready": False}, status=503)
+    return web.json_response({"ok": True, "bot_ready": True})
 
 
-async def run_health_server(host: str, port: int) -> None:
+async def run_health_server(host: str, port: int, bot_app: ConversionBot) -> None:
     """Run HTTP health check server for Cloud Run."""
     app = web.Application()
-    app["bot_app"] = None  # Will be set to True when bot starts successfully
+    app["bot_app"] = bot_app  # Store reference to initialized bot
     app.router.add_get("/", handle_root)
     app.router.add_get("/healthz", handle_healthz)
 
@@ -215,7 +217,21 @@ async def run_health_server(host: str, port: int) -> None:
 async def _main() -> None:
     logging.basicConfig(level=logging.INFO)
 
-    # Cloud Run health server config - start this FIRST before loading settings
+    # Load settings FIRST - fail fast if config is invalid
+    logging.info("Loading configuration...")
+    try:
+        settings = load_settings()
+        logging.info("Configuration loaded successfully")
+    except ValueError as exc:
+        logging.error(f"Configuration error: {exc}")
+        logging.error("Bot cannot start due to missing or invalid environment variables")
+        raise SystemExit(1) from exc
+
+    # Initialize bot
+    app = ConversionBot(settings)
+    logging.info("Bot initialized successfully")
+
+    # Cloud Run health server config - start AFTER bot is ready
     health_host = "0.0.0.0"
     health_port = int(os.getenv("PORT", "8080"))
 
@@ -229,51 +245,32 @@ async def _main() -> None:
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    # Start health server immediately so Cloud Run can see we're alive
-    health_task = asyncio.create_task(run_health_server(health_host, health_port))
-    # Give health server a moment to start listening
-    await asyncio.sleep(0.5)
-    logging.info("Health server started, loading configuration...")
+    # Start health server with initialized bot reference
+    health_task = asyncio.create_task(run_health_server(health_host, health_port, app))
+    await asyncio.sleep(0.5)  # Give health server a moment to start listening
+    logging.info("Health server started")
 
-    # Now try to load settings and start bot
-    polling_task = None
-    app = None
+    # Start bot polling
+    polling_task = asyncio.create_task(app.run())
+    logging.info("Bot polling started")
 
     try:
-        settings = load_settings()
-        app = ConversionBot(settings)
-        logging.info("Configuration loaded successfully, starting bot...")
-
-        # Create bot polling task
-        polling_task = asyncio.create_task(app.run())
-
         # Wait for shutdown signal
         await shutdown_event.wait()
         logging.info("Shutdown signal received, stopping services")
-    except ValueError as exc:
-        logging.error(f"Configuration error: {exc}")
-        logging.error("Bot cannot start due to missing or invalid environment variables")
-        logging.error("Health server will continue running for Cloud Run")
-        # Keep health server running even if bot config is invalid
-        await shutdown_event.wait()
     except Exception as exc:
         logging.error(f"Error in main loop: {exc}", exc_info=True)
     finally:
         # Cancel tasks
-        if polling_task:
-            polling_task.cancel()
+        polling_task.cancel()
         health_task.cancel()
 
         # Wait for tasks to complete cancellation
-        tasks_to_wait = [health_task]
-        if polling_task:
-            tasks_to_wait.append(polling_task)
-        await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+        await asyncio.gather(health_task, polling_task, return_exceptions=True)
 
-        # Cleanup resources if app was initialized
-        if app:
-            await app.converter.close()
-            await app.bot.session.close()
+        # Cleanup resources
+        await app.converter.close()
+        await app.bot.session.close()
 
         logging.info("Graceful shutdown complete")
 
