@@ -394,6 +394,8 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
             return
         except CommandExecutionError as exc:
             _record_fail("darktable-cli", exc.stderr, returncode=exc.returncode, timeout=exc.timeout)
+        except RuntimeError as exc:
+            _record_fail("darktable-cli", str(exc))
         except Exception as exc:
             _record_fail("darktable-cli", str(exc))
 
@@ -417,6 +419,8 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
             return
         except CommandExecutionError as exc:
             _record_fail("dcraw_emu", exc.stderr, returncode=exc.returncode, timeout=exc.timeout)
+        except RuntimeError as exc:
+            _record_fail("dcraw_emu", str(exc))
         except Exception as exc:
             _record_fail("dcraw_emu", str(exc))
 
@@ -440,6 +444,8 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
             return
         except CommandExecutionError as exc:
             _record_fail("dcraw", exc.stderr, returncode=exc.returncode, timeout=exc.timeout)
+        except RuntimeError as exc:
+            _record_fail("dcraw", str(exc))
         except Exception as exc:
             _record_fail("dcraw", str(exc))
 
