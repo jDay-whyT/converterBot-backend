@@ -13,6 +13,17 @@ def _required(name: str) -> str:
     return value
 
 
+def normalize_converter_url(raw: str) -> str:
+    normalized = raw.strip()
+    while normalized.endswith("/"):
+        normalized = normalized[:-1]
+
+    normalized = normalized.replace("/convert/convert", "/convert")
+    if normalized.endswith("/convert"):
+        return normalized
+    return f"{normalized}/convert"
+
+
 @dataclass(frozen=True)
 class Settings:
     bot_token: str
@@ -50,7 +61,7 @@ def load_settings() -> Settings:
         chat_id=int(_required("CHAT_ID")),
         topic_source_id=int(_required("TOPIC_SOURCE_ID")),
         topic_converted_id=int(_required("TOPIC_CONVERTED_ID")),
-        converter_url=_required("CONVERTER_URL").rstrip("/"),
+        converter_url=normalize_converter_url(_required("CONVERTER_URL")),
         converter_api_key=_required("CONVERTER_API_KEY"),
         max_file_mb=int(os.getenv("MAX_FILE_MB", "40")),
         batch_window_seconds=int(os.getenv("BATCH_WINDOW_SECONDS", "120")),

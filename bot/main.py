@@ -40,10 +40,13 @@ class ConverterClient:
             data["max_side"] = max_side
 
         headers = {"X-API-KEY": self.settings.converter_api_key}
+        final_url = self.settings.converter_url
+        file_size = path.stat().st_size
+        logging.info("converter_post url=%s filename=%s size=%s", final_url, path.name, file_size)
 
         request_started = perf_counter()
         response = await client.post(
-            f"{self.settings.converter_url}/convert",
+            final_url,
             headers=headers,
             files=files,
             data=data,
@@ -55,6 +58,14 @@ class ConverterClient:
             response.status_code,
             format_ms(request_elapsed),
         )
+        if response.status_code != 200:
+            body_preview = response.text[:2048]
+            logging.error(
+                "converter_response_error url=%s status_code=%s body=%s",
+                final_url,
+                response.status_code,
+                body_preview,
+            )
         response.raise_for_status()
 
         # Validate response content size
