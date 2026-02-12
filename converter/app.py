@@ -79,6 +79,7 @@ DEFAULT_SUBPROCESS_ENV = {
 MAX_STDERR_CHARS = int(os.getenv("MAX_STDERR_CHARS", "4096"))
 MIN_OUTPUT_BYTES = int(os.getenv("MIN_OUTPUT_BYTES", str(50 * 1024)))
 MIN_INPUT_BYTES = int(os.getenv("MIN_INPUT_BYTES", str(100 * 1024)))
+MIN_MEAN_LUMA = float(os.getenv("MIN_MEAN_LUMA", "0.02"))
 
 app = FastAPI(title="converter-service")
 
@@ -175,15 +176,58 @@ def _validate_output_file(path: Path, min_size_bytes: int = MIN_OUTPUT_BYTES) ->
         raise RuntimeError(f"output file too small: {path} ({size} bytes)")
 
 
-def _identify_ok(path: Path, min_dimension: int = 200) -> bool:
+def _identify_dimensions(path: Path) -> Optional[tuple[int, int]]:
     try:
         result = _run(["magick", "identify", "-format", "%w %h", str(path)], timeout=MAGICK_TIMEOUT_SECONDS)
         width_str, height_str = result.decode("utf-8", errors="ignore").strip().split(maxsplit=1)
         width = int(width_str)
         height = int(height_str)
     except Exception:
+        return None
+    return width, height
+
+
+def _identify_ok(path: Path, min_dimension: int = 200) -> bool:
+    dims = _identify_dimensions(path)
+    if not dims:
         return False
+    width, height = dims
     return width >= min_dimension and height >= min_dimension
+
+
+def _mean_luma(path: Path) -> float:
+    try:
+        result = _run(
+            [
+                "magick",
+                str(path),
+                "-colorspace",
+                "Gray",
+                "-resize",
+                "64x64!",
+                "-format",
+                "%[fx:mean]",
+                "info:",
+            ],
+            timeout=MAGICK_TIMEOUT_SECONDS,
+        )
+        return float(result.decode("utf-8", errors="ignore").strip())
+    except Exception:
+        return -1.0
+
+
+def _image_ok(path: Path, min_dimension: int = 200) -> bool:
+    dims = _identify_dimensions(path)
+    if not dims:
+        print(f"img_check path={path} w=na h=na mean=na ok=0", flush=True)
+        return False
+
+    width, height = dims
+    mean = _mean_luma(path)
+    ok = width >= min_dimension and height >= min_dimension and mean >= MIN_MEAN_LUMA
+    mean_str = f"{mean:.6f}" if mean >= 0 else "na"
+    print(f"img_check path={path} w={width} h={height} mean={mean_str} ok={int(ok)}", flush=True)
+    return ok
 
 
 def _find_decoded_raw_path(input_path: Path) -> Path:
@@ -229,29 +273,41 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
         _record_fail("exiftool", "command not found")
     else:
         preview_path = input_path.with_name("raw_preview.jpg")
-        for preview_tag in ("PreviewImage", "JpgFromRaw"):
+        for preview_tag in ("PreviewImage", "JpgFromRaw", "ThumbnailImage"):
             try:
-                preview_bytes = _run(["exiftool", "-b", f"-{preview_tag}", str(input_path)], timeout=SUBPROCESS_TIMEOUT_SECONDS)
-                if not preview_bytes:
-                    _record_fail(f"exiftool:{preview_tag}", "empty preview stream")
-                    continue
                 with open(preview_path, "wb") as preview_file:
-                    preview_file.write(preview_bytes)
+                    proc = subprocess.run(
+                        ["exiftool", "-b", f"-{preview_tag}", str(input_path)],
+                        stdout=preview_file,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+                        env={**os.environ, **DEFAULT_SUBPROCESS_ENV},
+                    )
+                stderr = _truncate_stderr(proc.stderr.decode("utf-8", errors="ignore") or "")
+                if proc.returncode != 0:
+                    raise CommandExecutionError("exiftool", proc.returncode, stderr or "preview extraction failed")
                 _validate_output_file(preview_path)
-                if not _identify_ok(preview_path):
-                    _record_fail(f"exiftool:{preview_tag}", "identify check failed for extracted preview")
+                if not _image_ok(preview_path):
+                    _record_fail(f"exiftool:{preview_tag}", "image check failed for extracted preview")
+                    preview_path.unlink(missing_ok=True)
                     continue
                 _magick_to_jpeg(preview_path, output_path, quality, max_side)
                 _validate_output_file(output_path)
-                if not _identify_ok(output_path):
-                    _record_fail(f"exiftool:{preview_tag}", "identify check failed for output jpeg")
+                if not _image_ok(output_path):
+                    _record_fail(f"exiftool:{preview_tag}", "image check failed for output jpeg")
                     continue
                 print(f"raw_step=exiftool:{preview_tag} status=ok reason=preview_extracted", flush=True)
                 return
             except CommandExecutionError as exc:
                 _record_fail(f"exiftool:{preview_tag}", exc.stderr, returncode=exc.returncode, timeout=exc.timeout)
+                preview_path.unlink(missing_ok=True)
+            except subprocess.TimeoutExpired:
+                _record_fail(f"exiftool:{preview_tag}", f"timeout after {SUBPROCESS_TIMEOUT_SECONDS}s", timeout=True)
+                preview_path.unlink(missing_ok=True)
             except Exception as exc:
                 _record_fail(f"exiftool:{preview_tag}", str(exc))
+                preview_path.unlink(missing_ok=True)
 
     # B) darktable-cli -> jpg -> magick -> jpg
     if shutil.which("darktable-cli") is None:
@@ -272,12 +328,12 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
                 "opencl=false",
             ], timeout=DARKTABLE_TIMEOUT_SECONDS, env_overrides={"DARKTABLE_NUM_THREADS": "1"})
             _validate_output_file(darktable_jpg)
-            if not _identify_ok(darktable_jpg):
-                raise RuntimeError("identify check failed for darktable output")
+            if not _image_ok(darktable_jpg):
+                raise RuntimeError("image check failed for darktable output")
             _magick_to_jpeg(darktable_jpg, output_path, quality, max_side)
             _validate_output_file(output_path)
-            if not _identify_ok(output_path):
-                raise RuntimeError("identify check failed for output jpeg")
+            if not _image_ok(output_path):
+                raise RuntimeError("image check failed for output jpeg")
             print("raw_step=darktable-cli status=ok reason=render_success", flush=True)
             return
         except CommandExecutionError as exc:
@@ -293,12 +349,12 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
             _run(["dcraw_emu", *decode_cmd], timeout=DCRAW_TIMEOUT_SECONDS)
             generated = _find_decoded_raw_path(input_path)
             _validate_output_file(generated)
-            if not _identify_ok(generated):
-                raise RuntimeError("identify check failed for decoded image")
+            if not _image_ok(generated):
+                raise RuntimeError("image check failed for decoded image")
             _magick_to_jpeg(generated, output_path, quality, max_side)
             _validate_output_file(output_path)
-            if not _identify_ok(output_path):
-                raise RuntimeError("identify check failed for output jpeg")
+            if not _image_ok(output_path):
+                raise RuntimeError("image check failed for output jpeg")
             print("raw_step=dcraw_emu status=ok reason=decode_success", flush=True)
             return
         except CommandExecutionError as exc:
@@ -314,12 +370,12 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
             _run(["dcraw", *decode_cmd], timeout=DCRAW_TIMEOUT_SECONDS)
             generated = _find_decoded_raw_path(input_path)
             _validate_output_file(generated)
-            if not _identify_ok(generated):
-                raise RuntimeError("identify check failed for decoded image")
+            if not _image_ok(generated):
+                raise RuntimeError("image check failed for decoded image")
             _magick_to_jpeg(generated, output_path, quality, max_side)
             _validate_output_file(output_path)
-            if not _identify_ok(output_path):
-                raise RuntimeError("identify check failed for output jpeg")
+            if not _image_ok(output_path):
+                raise RuntimeError("image check failed for output jpeg")
             print("raw_step=dcraw status=ok reason=decode_success", flush=True)
             return
         except CommandExecutionError as exc:
@@ -334,19 +390,22 @@ def _convert_heif_with_fallback(input_path: Path, output_path: Path, quality: in
     try:
         _magick_to_jpeg(input_path, output_path, quality, max_side)
         _validate_output_file(output_path)
+        if not _image_ok(output_path):
+            raise RuntimeError("image check failed for output jpeg")
         return
     except RuntimeError as exc:
-        err = str(exc).lower()
-        if "decode" not in err:
-            raise
         if shutil.which("heif-convert") is None:
             raise RuntimeError("HEIF decode failed and heif-convert is unavailable") from exc
 
     heif_tmp_jpg = input_path.with_name("heif_fallback.jpg")
     _run(["heif-convert", str(input_path), str(heif_tmp_jpg)], timeout=SUBPROCESS_TIMEOUT_SECONDS)
     _validate_output_file(heif_tmp_jpg)
+    if not _image_ok(heif_tmp_jpg):
+        raise RuntimeError("image check failed for heif-convert output")
     _magick_to_jpeg(heif_tmp_jpg, output_path, quality, max_side)
     _validate_output_file(output_path)
+    if not _image_ok(output_path):
+        raise RuntimeError("image check failed for output jpeg")
 
 
 async def _convert_raw_or_422(
@@ -358,6 +417,8 @@ async def _convert_raw_or_422(
     try:
         _convert_raw(in_path, out_path, quality, max_side)
         _validate_output_file(out_path)
+        if not _image_ok(out_path):
+            raise RuntimeError("image check failed for output jpeg")
     except RuntimeError as exc:
         raise HTTPException(status_code=422, detail=_truncate_stderr(f"RAW conversion failed: {exc}")) from exc
 
@@ -449,10 +510,14 @@ async def convert(
                 else:
                     _magick_to_jpeg(in_path, out_path, quality, max_side)
                 _validate_output_file(out_path)
+                if not _image_ok(out_path):
+                    raise RuntimeError("image check failed for output jpeg")
             except RuntimeError as exc:
                 raise HTTPException(status_code=422, detail=_truncate_stderr(f"conversion failed: {exc}")) from exc
 
         _validate_output_file(out_path)
+        if not _image_ok(out_path):
+            raise RuntimeError("image check failed for output jpeg")
     except Exception:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise
