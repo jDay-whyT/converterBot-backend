@@ -217,22 +217,27 @@ def _mean_luma(path: Path) -> float:
         return -1.0
 
 
-def _region_luma(path: Path, crop: str) -> float:
+def _region_luma(path: Path, crop: str, gravity: Optional[str] = None) -> float:
     try:
+        cmd = [
+            "magick",
+            str(path),
+            "-colorspace",
+            "Gray",
+        ]
+        if gravity:
+            cmd.extend(["-gravity", gravity])
+        cmd.extend([
+            "-crop",
+            crop,
+            "-resize",
+            "64x64!",
+            "-format",
+            "%[fx:mean]",
+            "info:",
+        ])
         result = _run(
-            [
-                "magick",
-                str(path),
-                "-colorspace",
-                "Gray",
-                "-crop",
-                crop,
-                "-resize",
-                "64x64!",
-                "-format",
-                "%[fx:mean]",
-                "info:",
-            ],
+            cmd,
             timeout=MAGICK_TIMEOUT_SECONDS,
         )
         return float(result.decode("utf-8", errors="ignore").strip())
@@ -242,10 +247,10 @@ def _region_luma(path: Path, crop: str) -> float:
 
 def _bands_ok(path: Path) -> bool:
     full = _region_luma(path, "100%x100%")
-    left = _region_luma(path, "50%x100%+0+0")
-    right = _region_luma(path, "50%x100%+50%+0")
-    top = _region_luma(path, "100%x50%+0+0")
-    bottom = _region_luma(path, "100%x50%+0+50%")
+    left = _region_luma(path, "50%x100%+0+0", gravity="West")
+    right = _region_luma(path, "50%x100%+0+0", gravity="East")
+    top = _region_luma(path, "100%x50%+0+0", gravity="North")
+    bottom = _region_luma(path, "100%x50%+0+0", gravity="South")
 
     means = (full, left, right, top, bottom)
     ok = all(mean >= MIN_REGION_MEAN_LUMA for mean in means)
@@ -379,14 +384,12 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
             _validate_output_file(darktable_jpg)
             fail_reason = _image_fail_reason(darktable_jpg)
             if fail_reason:
-                _record_fail("darktable-cli", fail_reason)
-                return
+                raise RuntimeError(fail_reason)
             _magick_to_jpeg(darktable_jpg, output_path, quality, max_side)
             _validate_output_file(output_path)
             fail_reason = _image_fail_reason(output_path)
             if fail_reason:
-                _record_fail("darktable-cli", fail_reason)
-                return
+                raise RuntimeError(fail_reason)
             print("raw_step=darktable-cli status=ok reason=render_success", flush=True)
             return
         except CommandExecutionError as exc:
@@ -404,14 +407,12 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
             _validate_output_file(generated)
             fail_reason = _image_fail_reason(generated)
             if fail_reason:
-                _record_fail("dcraw_emu", fail_reason)
-                return
+                raise RuntimeError(fail_reason)
             _magick_to_jpeg(generated, output_path, quality, max_side)
             _validate_output_file(output_path)
             fail_reason = _image_fail_reason(output_path)
             if fail_reason:
-                _record_fail("dcraw_emu", fail_reason)
-                return
+                raise RuntimeError(fail_reason)
             print("raw_step=dcraw_emu status=ok reason=decode_success", flush=True)
             return
         except CommandExecutionError as exc:
@@ -429,14 +430,12 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
             _validate_output_file(generated)
             fail_reason = _image_fail_reason(generated)
             if fail_reason:
-                _record_fail("dcraw", fail_reason)
-                return
+                raise RuntimeError(fail_reason)
             _magick_to_jpeg(generated, output_path, quality, max_side)
             _validate_output_file(output_path)
             fail_reason = _image_fail_reason(output_path)
             if fail_reason:
-                _record_fail("dcraw", fail_reason)
-                return
+                raise RuntimeError(fail_reason)
             print("raw_step=dcraw status=ok reason=decode_success", flush=True)
             return
         except CommandExecutionError as exc:
