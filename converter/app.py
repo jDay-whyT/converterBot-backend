@@ -655,10 +655,6 @@ async def convert(
                     raise RuntimeError("image check failed for output jpeg")
             except RuntimeError as exc:
                 raise HTTPException(status_code=422, detail=_truncate_stderr(f"conversion failed: {exc}")) from exc
-
-        _validate_output_file(out_path)
-        if not _image_ok(out_path):
-            raise RuntimeError("image check failed for output jpeg")
     except Exception:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise
@@ -679,7 +675,7 @@ async def convert(
 
 
 @app.on_event("startup")
-def _check_tools() -> None:
+async def _check_tools() -> None:
     missing = [tool for tool in ("magick",) if shutil.which(tool) is None]
     if shutil.which("exiftool") is None:
         missing.append("exiftool")
