@@ -40,6 +40,10 @@ MIME_TO_EXT = {
     "image/x-canon-cr2": ".cr2",
     "image/x-canon-cr3": ".cr3",
 }
+PHOTO_MIME_TO_EXT = {
+    "image/heif": ".heif",
+    "image/heic": ".heic",
+}
 
 
 def format_ms(seconds: float | None) -> int | None:
@@ -115,6 +119,7 @@ class ConversionBot:
     def _bind_handlers(self) -> None:
         self.dp.message.register(self._start, Command("start"))
         self.dp.message.register(self._handle_document, F.document)
+        self.dp.message.register(self._handle_photo, F.photo)
 
     async def start(self) -> None:
         """Initialize resources before starting the bot."""
@@ -192,6 +197,55 @@ class ConversionBot:
         if not Path(file_name).suffix:
             file_name = f"{file_name}{ext}"
 
+        await self._handle_file_pipeline(
+            message=message,
+            file_id=document.file_id,
+            file_name=file_name,
+            report_name=document.file_name or "file",
+            file_size=document.file_size,
+        )
+
+    async def _handle_photo(self, message: Message) -> None:
+        if not self._is_allowed_user(message):
+            await telegram_api_retry(
+                message.answer,
+                "Нет доступа",
+                max_retries=2,
+            )
+            return
+
+        if not self._is_source_topic(message):
+            return
+
+        assert message.photo
+        photo = message.photo[-1]
+        ext = self._resolve_photo_extension(photo)
+        file_name = f"{photo.file_id}{ext}"
+
+        await self._handle_file_pipeline(
+            message=message,
+            file_id=photo.file_id,
+            file_name=file_name,
+            report_name=file_name,
+            file_size=photo.file_size,
+        )
+
+    def _resolve_photo_extension(self, photo: object) -> str:
+        mime_type = (getattr(photo, "mime_type", None) or "").lower()
+        if not mime_type and hasattr(photo, "model_extra"):
+            model_extra = getattr(photo, "model_extra") or {}
+            mime_type = str(model_extra.get("mime_type", "")).lower()
+        return PHOTO_MIME_TO_EXT.get(mime_type, ".jpg")
+
+    async def _handle_file_pipeline(
+        self,
+        message: Message,
+        file_id: str,
+        file_name: str,
+        report_name: str,
+        file_size: int | None,
+    ) -> None:
+
         size_limit = self.settings.max_file_mb * 1024 * 1024
         batch = self.registry.get_or_create(
             chat_id=message.chat.id,
@@ -200,8 +254,8 @@ class ConversionBot:
         )
         batch.total += 1
 
-        if document.file_size and document.file_size > size_limit:
-            await self._register_result(batch, False, document.file_name or "file", "слишком большой файл")
+        if file_size and file_size > size_limit:
+            await self._register_result(batch, False, report_name, "слишком большой файл")
             return
 
         async with self.semaphore:
@@ -225,7 +279,7 @@ class ConversionBot:
                     source = Path(tmpdir) / file_name
                     file_info = await telegram_api_retry(
                         self.bot.get_file,
-                        document.file_id,
+                        file_id,
                         max_retries=2,
                     )
 
@@ -274,7 +328,7 @@ class ConversionBot:
                 reason = str(exc)
                 result = "error"
             finally:
-                await self._register_result(batch, ok, document.file_name or "file", reason)
+                await self._register_result(batch, ok, report_name, reason)
                 total_s = perf_counter() - total_started
                 short_reason = (reason or "").replace("\n", " ")[:120] or "-"
                 logging.info(
