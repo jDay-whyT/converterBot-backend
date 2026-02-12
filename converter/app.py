@@ -175,6 +175,17 @@ def _validate_output_file(path: Path, min_size_bytes: int = MIN_OUTPUT_BYTES) ->
         raise RuntimeError(f"output file too small: {path} ({size} bytes)")
 
 
+def _identify_ok(path: Path, min_dimension: int = 200) -> bool:
+    try:
+        result = _run(["magick", "identify", "-format", "%w %h", str(path)], timeout=MAGICK_TIMEOUT_SECONDS)
+        width_str, height_str = result.decode("utf-8", errors="ignore").strip().split(maxsplit=1)
+        width = int(width_str)
+        height = int(height_str)
+    except Exception:
+        return False
+    return width >= min_dimension and height >= min_dimension
+
+
 def _find_decoded_raw_path(input_path: Path) -> Path:
     candidates: list[Path] = []
     for suffix in RAW_DECODE_SUFFIXES:
@@ -207,50 +218,44 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
     errors: list[CommandError] = []
     decode_cmd = ["-T", "-w", "-q", "3", "-H", "0", str(input_path)]
 
-    # 1) dcraw_emu -> TIFF, then magick -> JPG
-    if shutil.which("dcraw_emu") is None:
-        errors.append(CommandError(tool="dcraw_emu", returncode=None, stderr="command not found", timeout=False))
-    else:
-        try:
-            _run(["dcraw_emu", *decode_cmd], timeout=DCRAW_TIMEOUT_SECONDS)
-            generated = _find_decoded_raw_path(input_path)
-            _validate_output_file(generated)
-            _magick_to_jpeg(generated, output_path, quality, max_side)
-            _validate_output_file(output_path)
-            return
-        except CommandExecutionError as exc:
-            print(
-                f"raw_step=dcraw_emu status=fail timeout={int(exc.timeout)} rc={exc.returncode} stderr={exc.stderr}",
-                flush=True,
-            )
-            errors.append(CommandError(tool="dcraw_emu", returncode=exc.returncode, stderr=exc.stderr, timeout=exc.timeout))
-        except Exception as exc:
-            stderr = _truncate_stderr(str(exc))
-            print(f"raw_step=dcraw_emu status=fail timeout=0 rc=na stderr={stderr}", flush=True)
-            errors.append(CommandError(tool="dcraw_emu", returncode=None, stderr=stderr, timeout=False))
+    def _record_fail(tool: str, reason: str, returncode: Optional[int] = None, timeout: bool = False) -> None:
+        stderr = _truncate_stderr(reason)
+        rc = "na" if returncode is None else str(returncode)
+        print(f"raw_step={tool} status=fail reason={stderr} timeout={int(timeout)} rc={rc}", flush=True)
+        errors.append(CommandError(tool=tool, returncode=returncode, stderr=stderr, timeout=timeout))
 
-    # 2) dcraw -> TIFF, then magick -> JPG
-    if shutil.which("dcraw") is None:
-        errors.append(CommandError(tool="dcraw", returncode=None, stderr="command not found", timeout=False))
+    # A) exiftool embedded preview -> magick -> jpg
+    if shutil.which("exiftool") is None:
+        _record_fail("exiftool", "command not found")
     else:
-        try:
-            _run(["dcraw", *decode_cmd], timeout=DCRAW_TIMEOUT_SECONDS)
-            generated = _find_decoded_raw_path(input_path)
-            _validate_output_file(generated)
-            _magick_to_jpeg(generated, output_path, quality, max_side)
-            _validate_output_file(output_path)
-            return
-        except CommandExecutionError as exc:
-            print(f"raw_step=dcraw status=fail timeout={int(exc.timeout)} rc={exc.returncode} stderr={exc.stderr}", flush=True)
-            errors.append(CommandError(tool="dcraw", returncode=exc.returncode, stderr=exc.stderr, timeout=exc.timeout))
-        except Exception as exc:
-            stderr = _truncate_stderr(str(exc))
-            print(f"raw_step=dcraw status=fail timeout=0 rc=na stderr={stderr}", flush=True)
-            errors.append(CommandError(tool="dcraw", returncode=None, stderr=stderr, timeout=False))
+        preview_path = input_path.with_name("raw_preview.jpg")
+        for preview_tag in ("PreviewImage", "JpgFromRaw"):
+            try:
+                preview_bytes = _run(["exiftool", "-b", f"-{preview_tag}", str(input_path)], timeout=SUBPROCESS_TIMEOUT_SECONDS)
+                if not preview_bytes:
+                    _record_fail(f"exiftool:{preview_tag}", "empty preview stream")
+                    continue
+                with open(preview_path, "wb") as preview_file:
+                    preview_file.write(preview_bytes)
+                _validate_output_file(preview_path)
+                if not _identify_ok(preview_path):
+                    _record_fail(f"exiftool:{preview_tag}", "identify check failed for extracted preview")
+                    continue
+                _magick_to_jpeg(preview_path, output_path, quality, max_side)
+                _validate_output_file(output_path)
+                if not _identify_ok(output_path):
+                    _record_fail(f"exiftool:{preview_tag}", "identify check failed for output jpeg")
+                    continue
+                print(f"raw_step=exiftool:{preview_tag} status=ok reason=preview_extracted", flush=True)
+                return
+            except CommandExecutionError as exc:
+                _record_fail(f"exiftool:{preview_tag}", exc.stderr, returncode=exc.returncode, timeout=exc.timeout)
+            except Exception as exc:
+                _record_fail(f"exiftool:{preview_tag}", str(exc))
 
-    # 3) darktable-cli -> jpg directly
+    # B) darktable-cli -> jpg -> magick -> jpg
     if shutil.which("darktable-cli") is None:
-        errors.append(CommandError(tool="darktable-cli", returncode=None, stderr="command not found", timeout=False))
+        _record_fail("darktable-cli", "command not found")
     else:
         try:
             darktable_jpg = input_path.with_name("raw_darktable.jpg")
@@ -267,23 +272,81 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
                 "opencl=false",
             ], timeout=DARKTABLE_TIMEOUT_SECONDS, env_overrides={"DARKTABLE_NUM_THREADS": "1"})
             _validate_output_file(darktable_jpg)
+            if not _identify_ok(darktable_jpg):
+                raise RuntimeError("identify check failed for darktable output")
             _magick_to_jpeg(darktable_jpg, output_path, quality, max_side)
             _validate_output_file(output_path)
+            if not _identify_ok(output_path):
+                raise RuntimeError("identify check failed for output jpeg")
+            print("raw_step=darktable-cli status=ok reason=render_success", flush=True)
             return
         except CommandExecutionError as exc:
-            print(
-                f"raw_step=darktable-cli status=fail timeout={int(exc.timeout)} rc={exc.returncode} stderr={exc.stderr}",
-                flush=True,
-            )
-            errors.append(
-                CommandError(tool="darktable-cli", returncode=exc.returncode, stderr=exc.stderr, timeout=exc.timeout)
-            )
+            _record_fail("darktable-cli", exc.stderr, returncode=exc.returncode, timeout=exc.timeout)
         except Exception as exc:
-            stderr = _truncate_stderr(str(exc))
-            print(f"raw_step=darktable-cli status=fail timeout=0 rc=na stderr={stderr}", flush=True)
-            errors.append(CommandError(tool="darktable-cli", returncode=None, stderr=stderr, timeout=False))
+            _record_fail("darktable-cli", str(exc))
+
+    # C1) dcraw_emu -> TIFF, then magick -> JPG
+    if shutil.which("dcraw_emu") is None:
+        _record_fail("dcraw_emu", "command not found")
+    else:
+        try:
+            _run(["dcraw_emu", *decode_cmd], timeout=DCRAW_TIMEOUT_SECONDS)
+            generated = _find_decoded_raw_path(input_path)
+            _validate_output_file(generated)
+            if not _identify_ok(generated):
+                raise RuntimeError("identify check failed for decoded image")
+            _magick_to_jpeg(generated, output_path, quality, max_side)
+            _validate_output_file(output_path)
+            if not _identify_ok(output_path):
+                raise RuntimeError("identify check failed for output jpeg")
+            print("raw_step=dcraw_emu status=ok reason=decode_success", flush=True)
+            return
+        except CommandExecutionError as exc:
+            _record_fail("dcraw_emu", exc.stderr, returncode=exc.returncode, timeout=exc.timeout)
+        except Exception as exc:
+            _record_fail("dcraw_emu", str(exc))
+
+    # C2) dcraw -> TIFF, then magick -> JPG
+    if shutil.which("dcraw") is None:
+        _record_fail("dcraw", "command not found")
+    else:
+        try:
+            _run(["dcraw", *decode_cmd], timeout=DCRAW_TIMEOUT_SECONDS)
+            generated = _find_decoded_raw_path(input_path)
+            _validate_output_file(generated)
+            if not _identify_ok(generated):
+                raise RuntimeError("identify check failed for decoded image")
+            _magick_to_jpeg(generated, output_path, quality, max_side)
+            _validate_output_file(output_path)
+            if not _identify_ok(output_path):
+                raise RuntimeError("identify check failed for output jpeg")
+            print("raw_step=dcraw status=ok reason=decode_success", flush=True)
+            return
+        except CommandExecutionError as exc:
+            _record_fail("dcraw", exc.stderr, returncode=exc.returncode, timeout=exc.timeout)
+        except Exception as exc:
+            _record_fail("dcraw", str(exc))
 
     raise RuntimeError("RAW conversion failed; " + _format_raw_errors(errors))
+
+
+def _convert_heif_with_fallback(input_path: Path, output_path: Path, quality: int, max_side: Optional[int]) -> None:
+    try:
+        _magick_to_jpeg(input_path, output_path, quality, max_side)
+        _validate_output_file(output_path)
+        return
+    except RuntimeError as exc:
+        err = str(exc).lower()
+        if "decode" not in err:
+            raise
+        if shutil.which("heif-convert") is None:
+            raise RuntimeError("HEIF decode failed and heif-convert is unavailable") from exc
+
+    heif_tmp_jpg = input_path.with_name("heif_fallback.jpg")
+    _run(["heif-convert", str(input_path), str(heif_tmp_jpg)], timeout=SUBPROCESS_TIMEOUT_SECONDS)
+    _validate_output_file(heif_tmp_jpg)
+    _magick_to_jpeg(heif_tmp_jpg, output_path, quality, max_side)
+    _validate_output_file(output_path)
 
 
 async def _convert_raw_or_422(
@@ -381,7 +444,10 @@ async def convert(
             )
         else:
             try:
-                _magick_to_jpeg(in_path, out_path, quality, max_side)
+                if suffix in {".heic", ".heif"}:
+                    _convert_heif_with_fallback(in_path, out_path, quality, max_side)
+                else:
+                    _magick_to_jpeg(in_path, out_path, quality, max_side)
                 _validate_output_file(out_path)
             except RuntimeError as exc:
                 raise HTTPException(status_code=422, detail=_truncate_stderr(f"conversion failed: {exc}")) from exc
@@ -409,6 +475,10 @@ async def convert(
 @app.on_event("startup")
 def _check_tools() -> None:
     missing = [tool for tool in ("magick",) if shutil.which(tool) is None]
+    if shutil.which("exiftool") is None:
+        missing.append("exiftool")
+    if shutil.which("heif-convert") is None:
+        missing.append("heif-convert")
     if shutil.which("dcraw_emu") is None and shutil.which("dcraw") is None:
         missing.append("dcraw_emu|dcraw")
     if shutil.which("darktable-cli") is None:
