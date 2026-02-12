@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 os.environ["CONVERTER_API_KEY"] = "test_secret"
 os.environ["MAX_FILE_MB"] = "40"
 
-from app import app, _run
+from app import app, _black_band_detected, _decoder_route, _run
 
 
 class ConverterAppTests(unittest.TestCase):
@@ -44,18 +44,6 @@ class ConverterAppTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 401)
 
-    def test_convert_unsupported_extension(self) -> None:
-        with tempfile.NamedTemporaryFile(suffix=".txt") as tmp:
-            tmp.write(b"text file")
-            tmp.seek(0)
-            response = self.client.post(
-                "/convert",
-                headers={"X-API-KEY": "test_secret"},
-                files={"file": ("test.txt", tmp, "application/octet-stream")},
-            )
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("unsupported file extension", response.json()["detail"])
-
     def test_convert_quality_out_of_range(self) -> None:
         with tempfile.NamedTemporaryFile(suffix=".heic") as tmp:
             tmp.write(b"fake heic data")
@@ -68,6 +56,23 @@ class ConverterAppTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 400)
         self.assertIn("quality must be in range", response.json()["detail"])
+
+    @patch("app._detect_filetype", return_value=("JPEG", "image/jpeg"))
+    @patch("app._magick_to_jpeg")
+    def test_convert_dng_with_jpeg_filetype_uses_magick_route(self, mock_magick: MagicMock, _mock_detect: MagicMock) -> None:
+        def _write_output(_in: Path, out: Path, _quality: int, _max_side: int | None) -> None:
+            out.write_bytes(b"x" * 60000)
+
+        mock_magick.side_effect = _write_output
+        with patch("app._image_ok", return_value=True):
+            response = self.client.post(
+                "/convert",
+                headers={"X-API-KEY": "test_secret"},
+                files={"file": ("fake.dng", b"jpeg-content", "application/octet-stream")},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(mock_magick.called)
 
     def test_convert_invalid_max_side(self) -> None:
         with tempfile.NamedTemporaryFile(suffix=".heic") as tmp:
@@ -102,6 +107,21 @@ class ConverterAppTests(unittest.TestCase):
     def test_run_command_failure(self) -> None:
         with self.assertRaises(RuntimeError):
             _run(["false"])
+
+
+    def test_decoder_route_dng_extension_but_jpeg_content(self) -> None:
+        route = _decoder_route("JPEG", "image/jpeg")
+        self.assertEqual(route, "magick")
+
+    def test_black_band_detector_detects_half_black_frame(self) -> None:
+        with patch("app._region_luma", side_effect=[0.20, 0.15, 0.12, 0.11, 0.0001]):
+            detected = _black_band_detected(Path("dummy.jpg"))
+        self.assertTrue(detected)
+
+    def test_black_band_detector_disabled_for_dark_scene(self) -> None:
+        with patch("app._region_luma", side_effect=[0.01, 0.0, 0.0, 0.0, 0.0]):
+            detected = _black_band_detected(Path("dummy.jpg"))
+        self.assertFalse(detected)
 
 
 class ConverterIntegrationTests(unittest.TestCase):

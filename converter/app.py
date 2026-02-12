@@ -5,7 +5,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
@@ -79,8 +79,8 @@ DEFAULT_SUBPROCESS_ENV = {
 MAX_STDERR_CHARS = int(os.getenv("MAX_STDERR_CHARS", "4096"))
 MIN_OUTPUT_BYTES = int(os.getenv("MIN_OUTPUT_BYTES", str(50 * 1024)))
 MIN_INPUT_BYTES = int(os.getenv("MIN_INPUT_BYTES", str(100 * 1024)))
-MIN_MEAN_LUMA = float(os.getenv("MIN_MEAN_LUMA", "0.02"))
-MIN_REGION_MEAN_LUMA = float(os.getenv("MIN_REGION_MEAN_LUMA", "0.015"))
+MIN_BLACK_BAND_LUMA = float(os.getenv("MIN_BLACK_BAND_LUMA", "0.002"))
+MIN_SCENE_LUMA_FOR_BAND_CHECK = float(os.getenv("MIN_SCENE_LUMA_FOR_BAND_CHECK", "0.03"))
 
 app = FastAPI(title="converter-service")
 
@@ -196,27 +196,6 @@ def _identify_ok(path: Path, min_dimension: int = 200) -> bool:
     return width >= min_dimension and height >= min_dimension
 
 
-def _mean_luma(path: Path) -> float:
-    try:
-        result = _run(
-            [
-                "magick",
-                str(path),
-                "-colorspace",
-                "Gray",
-                "-resize",
-                "64x64!",
-                "-format",
-                "%[fx:mean]",
-                "info:",
-            ],
-            timeout=MAGICK_TIMEOUT_SECONDS,
-        )
-        return float(result.decode("utf-8", errors="ignore").strip())
-    except Exception:
-        return -1.0
-
-
 def _region_luma(path: Path, crop: str, gravity: Optional[str] = None) -> float:
     try:
         cmd = [
@@ -245,35 +224,31 @@ def _region_luma(path: Path, crop: str, gravity: Optional[str] = None) -> float:
         return -1.0
 
 
-def _bands_ok(path: Path) -> bool:
+def _black_band_detected(path: Path) -> bool:
     full = _region_luma(path, "100%x100%")
     left = _region_luma(path, "50%x100%+0+0", gravity="West")
     right = _region_luma(path, "50%x100%+0+0", gravity="East")
     top = _region_luma(path, "100%x50%+0+0", gravity="North")
     bottom = _region_luma(path, "100%x50%+0+0", gravity="South")
 
-    means = (full, left, right, top, bottom)
-    ok = all(mean >= MIN_REGION_MEAN_LUMA for mean in means)
+    mean_edges = (left, right, top, bottom)
+    black_band = full >= MIN_SCENE_LUMA_FOR_BAND_CHECK and min(mean_edges) < MIN_BLACK_BAND_LUMA
     mean_str = lambda val: f"{val:.6f}" if val >= 0 else "na"
     print(
         "img_check "
         f"mean_full={mean_str(full)} mean_l={mean_str(left)} mean_r={mean_str(right)} "
-        f"mean_t={mean_str(top)} mean_b={mean_str(bottom)} ok={int(ok)}",
+        f"mean_t={mean_str(top)} mean_b={mean_str(bottom)} black_band={int(black_band)}",
         flush=True,
     )
-    return ok
+    return black_band
 
 
 def _image_fail_reason(path: Path, min_dimension: int = 200) -> Optional[str]:
     if not _identify_ok(path, min_dimension=min_dimension):
         return "identify_failed"
 
-    mean = _mean_luma(path)
-    if mean < MIN_MEAN_LUMA:
-        return "mean_failed"
-
-    if not _bands_ok(path):
-        return "band_check_failed"
+    if _black_band_detected(path):
+        return "black_band_detected"
 
     return None
 
@@ -306,8 +281,34 @@ def _format_raw_errors(errors: list[CommandError]) -> str:
     for err in errors:
         timeout = " timeout=1" if err.timeout else ""
         returncode = "na" if err.returncode is None else str(err.returncode)
-        parts.append(f"raw_step={err.tool} rc={returncode}{timeout} stderr={err.stderr}")
+        parts.append(f"raw_step={err.tool} status=fail reason={err.stderr} rc={returncode}{timeout}")
     return " | ".join(parts)
+
+
+def _detect_filetype(input_path: Path) -> tuple[str, str]:
+    output = _run(["exiftool", "-s3", "-FileType", "-MIMEType", str(input_path)])
+    values = [line.strip() for line in output.decode("utf-8", errors="ignore").splitlines() if line.strip()]
+    if len(values) < 2:
+        raise RuntimeError("failed to detect file type")
+    return values[0], values[1].lower()
+
+
+def _decoder_route(file_type: str, mime_type: str) -> Literal["heif", "magick", "raw"]:
+    normalized_type = file_type.lower()
+    if normalized_type in {"heic", "heif"} or mime_type in {"image/heic", "image/heif"}:
+        return "heif"
+    if normalized_type in {"jpeg", "jpg", "png", "tif", "tiff", "webp"} or mime_type in {
+        "image/jpeg",
+        "image/png",
+        "image/tiff",
+        "image/webp",
+    }:
+        return "magick"
+    if normalized_type in {suffix[1:] for suffix in RAW_SUFFIXES}:
+        return "raw"
+    if mime_type in RAW_MIME_TYPES or any(mime_type.startswith(prefix) for prefix in RAW_MIME_PREFIXES):
+        return "raw"
+    raise RuntimeError(f"unsupported detected file type: {file_type} ({mime_type})")
 
 
 def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Optional[int]) -> None:
@@ -340,8 +341,20 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
                     )
                 stderr = _truncate_stderr(proc.stderr.decode("utf-8", errors="ignore") or "")
                 if proc.returncode != 0:
+                    if "doesn't exist" in stderr.lower() or "not found" in stderr.lower():
+                        print(
+                            f"raw_step=exiftool:{preview_tag} status=skip reason=tag_missing_or_empty rc={proc.returncode}",
+                            flush=True,
+                        )
+                        preview_path.unlink(missing_ok=True)
+                        continue
                     raise CommandExecutionError("exiftool", proc.returncode, stderr or "preview extraction failed")
-                _validate_output_file(preview_path)
+                try:
+                    _validate_output_file(preview_path)
+                except RuntimeError:
+                    print(f"raw_step=exiftool:{preview_tag} status=skip reason=tag_missing_or_empty rc=0", flush=True)
+                    preview_path.unlink(missing_ok=True)
+                    continue
                 fail_reason = _image_fail_reason(preview_path)
                 if fail_reason:
                     _record_fail(f"exiftool:{preview_tag}", fail_reason)
@@ -384,9 +397,8 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
                 "opencl=false",
             ], timeout=DARKTABLE_TIMEOUT_SECONDS, env_overrides={"DARKTABLE_NUM_THREADS": "1"})
             _validate_output_file(darktable_jpg)
-            fail_reason = _image_fail_reason(darktable_jpg)
-            if fail_reason:
-                raise RuntimeError(fail_reason)
+            if _black_band_detected(darktable_jpg):
+                raise RuntimeError("black_band_detected")
             _magick_to_jpeg(darktable_jpg, output_path, quality, max_side)
             _validate_output_file(output_path)
             fail_reason = _image_fail_reason(output_path)
@@ -401,7 +413,43 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
         except Exception as exc:
             _record_fail("darktable-cli", str(exc))
 
-    # C1) dcraw_emu -> TIFF, then magick -> JPG
+    # C1) rawtherapee-cli -> TIFF, then magick -> JPG
+    if shutil.which("rawtherapee-cli") is None:
+        _record_fail("rawtherapee-cli", "command not found")
+    else:
+        try:
+            rawtherapee_tif = input_path.with_name("rawtherapee.tif")
+            _run(
+                [
+                    "rawtherapee-cli",
+                    "-Y",
+                    "-c",
+                    str(input_path),
+                    "-o",
+                    str(rawtherapee_tif),
+                    "-t",
+                ],
+                timeout=DCRAW_TIMEOUT_SECONDS,
+            )
+            _validate_output_file(rawtherapee_tif)
+            fail_reason = _image_fail_reason(rawtherapee_tif)
+            if fail_reason:
+                raise RuntimeError(fail_reason)
+            _magick_to_jpeg(rawtherapee_tif, output_path, quality, max_side)
+            _validate_output_file(output_path)
+            fail_reason = _image_fail_reason(output_path)
+            if fail_reason:
+                raise RuntimeError(fail_reason)
+            print("raw_step=rawtherapee-cli status=ok reason=decode_success", flush=True)
+            return
+        except CommandExecutionError as exc:
+            _record_fail("rawtherapee-cli", exc.stderr, returncode=exc.returncode, timeout=exc.timeout)
+        except RuntimeError as exc:
+            _record_fail("rawtherapee-cli", str(exc))
+        except Exception as exc:
+            _record_fail("rawtherapee-cli", str(exc))
+
+    # C2) dcraw_emu -> TIFF, then magick -> JPG
     if shutil.which("dcraw_emu") is None:
         _record_fail("dcraw_emu", "command not found")
     else:
@@ -426,7 +474,7 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
         except Exception as exc:
             _record_fail("dcraw_emu", str(exc))
 
-    # C2) dcraw -> TIFF, then magick -> JPG
+    # C3) dcraw -> TIFF, then magick -> JPG
     if shutil.which("dcraw") is None:
         _record_fail("dcraw", "command not found")
     else:
@@ -455,15 +503,8 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
 
 
 def _convert_heif_with_fallback(input_path: Path, output_path: Path, quality: int, max_side: Optional[int]) -> None:
-    try:
-        _magick_to_jpeg(input_path, output_path, quality, max_side)
-        _validate_output_file(output_path)
-        if not _image_ok(output_path):
-            raise RuntimeError("image check failed for output jpeg")
-        return
-    except RuntimeError as exc:
-        if shutil.which("heif-convert") is None:
-            raise RuntimeError("HEIF decode failed and heif-convert is unavailable") from exc
+    if shutil.which("heif-convert") is None:
+        raise RuntimeError("HEIF decode failed and heif-convert is unavailable")
 
     heif_tmp_jpg = input_path.with_name("heif_fallback.jpg")
     _run(["heif-convert", str(input_path), str(heif_tmp_jpg)], timeout=SUBPROCESS_TIMEOUT_SECONDS)
@@ -488,22 +529,7 @@ async def _convert_raw_or_422(
         if not _image_ok(out_path):
             raise RuntimeError("image check failed for output jpeg")
     except RuntimeError as exc:
-        raise HTTPException(status_code=422, detail=_truncate_stderr(f"RAW conversion failed: {exc}")) from exc
-
-
-def _is_raw_upload(suffix: str, content_type: Optional[str]) -> bool:
-    normalized_suffix = suffix.lower()
-    if normalized_suffix in RAW_SUFFIXES:
-        return True
-
-    if normalized_suffix in (ALLOWED_SUFFIXES - RAW_SUFFIXES):
-        return False
-
-    if not content_type:
-        return False
-
-    ct = content_type.lower()
-    return ct in RAW_MIME_TYPES or any(ct.startswith(prefix) for prefix in RAW_MIME_PREFIXES)
+        raise HTTPException(status_code=422, detail=_truncate_stderr(str(exc))) from exc
 
 
 @app.get("/health")
@@ -525,9 +551,6 @@ async def convert(
 
     filename = file.filename or "input.bin"
     suffix = Path(filename).suffix.lower()
-    is_raw = _is_raw_upload(suffix, file.content_type)
-    if suffix not in ALLOWED_SUFFIXES and not (not suffix and is_raw):
-        raise HTTPException(status_code=400, detail="unsupported file extension")
 
     if quality < 1 or quality > 100:
         raise HTTPException(status_code=400, detail="quality must be in range 1..100")
@@ -541,7 +564,7 @@ async def convert(
         raise HTTPException(status_code=413, detail=f"file too large: max {MAX_FILE_MB}MB")
 
     tmpdir = Path(tempfile.mkdtemp(prefix="convert-"))
-    effective_suffix = suffix or (".dng" if is_raw else ".bin")
+    effective_suffix = suffix or ".bin"
     in_path = tmpdir / f"input{effective_suffix}"
     out_path = tmpdir / "output.jpg"
 
@@ -551,7 +574,18 @@ async def convert(
 
         input_size = in_path.stat().st_size
 
-        if is_raw:
+        try:
+            file_type, mime_type = _detect_filetype(in_path)
+            route = _decoder_route(file_type, mime_type)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=_truncate_stderr(str(exc))) from exc
+
+        print(
+            f"detect_filetype ext={suffix or 'none'} file_type={file_type} mime_type={mime_type} route={route}",
+            flush=True,
+        )
+
+        if route == "raw":
             if input_size < MIN_INPUT_BYTES:
                 raise HTTPException(
                     status_code=422,
@@ -573,7 +607,7 @@ async def convert(
             )
         else:
             try:
-                if suffix in {".heic", ".heif"}:
+                if route == "heif":
                     _convert_heif_with_fallback(in_path, out_path, quality, max_side)
                 else:
                     _magick_to_jpeg(in_path, out_path, quality, max_side)
@@ -616,6 +650,8 @@ def _check_tools() -> None:
         missing.append("dcraw_emu|dcraw")
     if shutil.which("darktable-cli") is None:
         missing.append("darktable-cli")
+    if shutil.which("rawtherapee-cli") is None:
+        missing.append("rawtherapee-cli")
 
     # Check for libheif support in ImageMagick
     try:
