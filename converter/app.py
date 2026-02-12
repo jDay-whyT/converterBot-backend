@@ -312,7 +312,9 @@ def _format_raw_errors(errors: list[CommandError]) -> str:
 
 def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Optional[int]) -> None:
     errors: list[CommandError] = []
-    decode_cmd = ["-T", "-w", "-q", "3", "-H", "0", str(input_path)]
+    # dcraw parameters: -T (TIFF output), -w (camera white balance), -q 3 (cubic interpolation),
+    # -H 2 (highlight recovery mode 2 - reconstructs clipped highlights), -6 (16-bit output for better dynamic range)
+    decode_cmd = ["-T", "-w", "-q", "3", "-H", "2", "-6", str(input_path)]
 
     def _record_fail(tool: str, reason: str, returncode: Optional[int] = None, timeout: bool = False) -> None:
         stderr = _truncate_stderr(reason)
