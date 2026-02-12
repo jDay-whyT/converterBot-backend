@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 os.environ["CONVERTER_API_KEY"] = "test_secret"
 os.environ["MAX_FILE_MB"] = "40"
 
-from app import app, _black_band_detected, _decoder_route, _run
+from app import app, _black_band_detected, _decoder_route, _mapped_extension, _run
 
 
 class ConverterAppTests(unittest.TestCase):
@@ -113,6 +113,10 @@ class ConverterAppTests(unittest.TestCase):
         route = _decoder_route("JPEG", "image/jpeg")
         self.assertEqual(route, "magick")
 
+    def test_mapped_extension_prefers_detected_filetype(self) -> None:
+        self.assertEqual(_mapped_extension("HEIC", "image/heic"), ".heic")
+        self.assertEqual(_mapped_extension("JPEG", "image/jpeg"), ".jpg")
+
     def test_black_band_detector_detects_half_black_frame(self) -> None:
         with patch("app._region_luma", side_effect=[0.20, 0.15, 0.12, 0.11, 0.0001]):
             detected = _black_band_detected(Path("dummy.jpg"))
@@ -122,6 +126,24 @@ class ConverterAppTests(unittest.TestCase):
         with patch("app._region_luma", side_effect=[0.01, 0.0, 0.0, 0.0, 0.0]):
             detected = _black_band_detected(Path("dummy.jpg"))
         self.assertFalse(detected)
+
+    @patch("app._detect_filetype", return_value=("JPEG", "image/jpeg"))
+    @patch("app._magick_to_jpeg")
+    def test_convert_renames_input_to_detected_extension(self, mock_magick: MagicMock, _mock_detect: MagicMock) -> None:
+        def _write_output(_in: Path, out: Path, _quality: int, _max_side: int | None) -> None:
+            out.write_bytes(b"x" * 60000)
+
+        mock_magick.side_effect = _write_output
+        with patch("app._image_ok", return_value=True):
+            response = self.client.post(
+                "/convert",
+                headers={"X-API-KEY": "test_secret"},
+                files={"file": ("upload", b"jpeg-content", "application/octet-stream")},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        in_path = mock_magick.call_args[0][0]
+        self.assertEqual(in_path.suffix.lower(), ".jpg")
 
 
 class ConverterIntegrationTests(unittest.TestCase):

@@ -64,6 +64,18 @@ RAW_MIME_TYPES = {
 ALLOWED_SUFFIXES = {".heic", ".heif", ".webp", ".tif", ".tiff", *RAW_SUFFIXES}
 RAW_DECODE_SUFFIXES = (".tiff", ".tif", ".ppm", ".pgm")
 
+FILETYPE_EXTENSION_MAP = {
+    "heic": ".heic",
+    "heif": ".heif",
+    "jpeg": ".jpg",
+    "jpg": ".jpg",
+    "png": ".png",
+    "tif": ".tif",
+    "tiff": ".tiff",
+    "webp": ".webp",
+    **{suffix[1:]: suffix for suffix in RAW_SUFFIXES},
+}
+
 SUBPROCESS_TIMEOUT_SECONDS = int(os.getenv("SUBPROCESS_TIMEOUT_SECONDS", "90"))
 MAGICK_TIMEOUT_SECONDS = int(os.getenv("MAGICK_TIMEOUT_SECONDS", "90"))
 DCRAW_TIMEOUT_SECONDS = int(os.getenv("DCRAW_TIMEOUT_SECONDS", "120"))
@@ -311,6 +323,23 @@ def _decoder_route(file_type: str, mime_type: str) -> Literal["heif", "magick", 
     raise RuntimeError(f"unsupported detected file type: {file_type} ({mime_type})")
 
 
+def _mapped_extension(file_type: str, mime_type: str) -> Optional[str]:
+    normalized_type = file_type.lower()
+    mapped = FILETYPE_EXTENSION_MAP.get(normalized_type)
+    if mapped:
+        return mapped
+
+    mime_map = {
+        "image/heic": ".heic",
+        "image/heif": ".heif",
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/tiff": ".tiff",
+        "image/webp": ".webp",
+    }
+    return mime_map.get(mime_type)
+
+
 def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Optional[int]) -> None:
     errors: list[CommandError] = []
     # dcraw parameters: -T (TIFF output), -w (camera white balance), -q 3 (cubic interpolation),
@@ -549,8 +578,8 @@ async def convert(
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="invalid api key")
 
-    filename = file.filename or "input.bin"
-    suffix = Path(filename).suffix.lower()
+    orig_name = file.filename or "upload"
+    suffix = Path(orig_name).suffix.lower()
 
     if quality < 1 or quality > 100:
         raise HTTPException(status_code=400, detail="quality must be in range 1..100")
@@ -579,6 +608,16 @@ async def convert(
             route = _decoder_route(file_type, mime_type)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=_truncate_stderr(str(exc))) from exc
+
+        mapped_ext = _mapped_extension(file_type, mime_type)
+        if mapped_ext and in_path.suffix.lower() != mapped_ext:
+            renamed_path = tmpdir / f"input{mapped_ext}"
+            in_path = in_path.rename(renamed_path)
+
+        print(
+            f"input_saved path={in_path} orig={file.filename} size={input_size} filetype={file_type} mimetype={mime_type}",
+            flush=True,
+        )
 
         print(
             f"detect_filetype ext={suffix or 'none'} file_type={file_type} mime_type={mime_type} route={route}",
