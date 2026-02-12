@@ -11,12 +11,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libheif1 \
     libheif-plugin-libde265 \
     libde265-0 \
+    libheif-examples \
     libjpeg62-turbo \
     liblcms2-2 \
     zlib1g \
     libraw-bin \
     dcraw \
     darktable \
+    exiftool \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
