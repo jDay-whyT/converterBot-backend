@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
+from starlette.background import BackgroundTask
 
 API_KEY = os.getenv("CONVERTER_API_KEY", "")
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "40"))
@@ -76,6 +77,7 @@ DEFAULT_SUBPROCESS_ENV = {
 }
 
 MAX_STDERR_CHARS = int(os.getenv("MAX_STDERR_CHARS", "4096"))
+MIN_OUTPUT_BYTES = int(os.getenv("MIN_OUTPUT_BYTES", str(50 * 1024)))
 
 app = FastAPI(title="converter-service")
 
@@ -164,6 +166,14 @@ def _magick_to_jpeg(input_path: Path, output_path: Path, quality: int, max_side:
     _run(cmd, timeout=MAGICK_TIMEOUT_SECONDS)
 
 
+def _validate_output_file(path: Path, min_size_bytes: int = MIN_OUTPUT_BYTES) -> None:
+    if not path.exists() or not path.is_file():
+        raise RuntimeError(f"output file missing: {path}")
+    size = path.stat().st_size
+    if size < min_size_bytes:
+        raise RuntimeError(f"output file too small: {path} ({size} bytes)")
+
+
 def _find_decoded_raw_path(input_path: Path) -> Path:
     candidates: list[Path] = []
     for suffix in RAW_DECODE_SUFFIXES:
@@ -203,7 +213,9 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
         try:
             _run(["dcraw_emu", *decode_cmd], timeout=DCRAW_TIMEOUT_SECONDS)
             generated = _find_decoded_raw_path(input_path)
+            _validate_output_file(generated)
             _magick_to_jpeg(generated, output_path, quality, max_side)
+            _validate_output_file(output_path)
             return
         except CommandExecutionError as exc:
             print(
@@ -223,7 +235,9 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
         try:
             _run(["dcraw", *decode_cmd], timeout=DCRAW_TIMEOUT_SECONDS)
             generated = _find_decoded_raw_path(input_path)
+            _validate_output_file(generated)
             _magick_to_jpeg(generated, output_path, quality, max_side)
+            _validate_output_file(output_path)
             return
         except CommandExecutionError as exc:
             print(f"raw_step=dcraw status=fail timeout={int(exc.timeout)} rc={exc.returncode} stderr={exc.stderr}", flush=True)
@@ -251,7 +265,9 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
                 "--conf",
                 "opencl=false",
             ], timeout=DARKTABLE_TIMEOUT_SECONDS, env_overrides={"DARKTABLE_NUM_THREADS": "1"})
+            _validate_output_file(darktable_jpg)
             _magick_to_jpeg(darktable_jpg, output_path, quality, max_side)
+            _validate_output_file(output_path)
             return
         except CommandExecutionError as exc:
             print(
@@ -318,10 +334,12 @@ async def convert(
     if size_bytes > MAX_FILE_MB * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"file too large: max {MAX_FILE_MB}MB")
 
-    with tempfile.TemporaryDirectory(prefix="convert-") as tmpdir:
-        effective_suffix = suffix or (".dng" if is_raw else ".bin")
-        in_path = Path(tmpdir) / f"input{effective_suffix}"
-        out_path = Path(tmpdir) / "output.jpg"
+    tmpdir = Path(tempfile.mkdtemp(prefix="convert-"))
+    effective_suffix = suffix or (".dng" if is_raw else ".bin")
+    in_path = tmpdir / f"input{effective_suffix}"
+    out_path = tmpdir / "output.jpg"
+
+    try:
         in_path.write_bytes(content)
 
         try:
@@ -329,22 +347,28 @@ async def convert(
                 _convert_raw(in_path, out_path, quality, max_side)
             else:
                 _magick_to_jpeg(in_path, out_path, quality, max_side)
+                _validate_output_file(out_path)
         except RuntimeError as exc:
             raise HTTPException(status_code=422, detail=_truncate_stderr(f"conversion failed: {exc}")) from exc
 
-        if not out_path.exists() or out_path.stat().st_size == 0:
-            raise HTTPException(status_code=500, detail="conversion failed: empty output")
-
-        output = out_path.read_bytes()
+        _validate_output_file(out_path)
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
 
     elapsed_ms = round((time.monotonic() - start) * 1000, 2)
     print(
-        f"status=ok ext={suffix} in_bytes={size_bytes} out_bytes={len(output)} quality={quality} "
+        f"status=ok ext={suffix} in_bytes={size_bytes} out_bytes={out_path.stat().st_size} quality={quality} "
         f"max_side={max_side} elapsed_ms={elapsed_ms}",
         flush=True,
     )
 
-    return Response(content=output, media_type="image/jpeg")
+    return FileResponse(
+        path=out_path,
+        media_type="image/jpeg",
+        filename="output.jpg",
+        background=BackgroundTask(lambda: shutil.rmtree(tmpdir, ignore_errors=True)),
+    )
 
 
 @app.on_event("startup")
