@@ -199,7 +199,7 @@ def _format_raw_errors(errors: list[CommandError]) -> str:
     for err in errors:
         timeout = " timeout=1" if err.timeout else ""
         returncode = "na" if err.returncode is None else str(err.returncode)
-        parts.append(f"{err.tool} rc={returncode}{timeout} err={err.stderr}")
+        parts.append(f"raw_step={err.tool} rc={returncode}{timeout} stderr={err.stderr}")
     return " | ".join(parts)
 
 
