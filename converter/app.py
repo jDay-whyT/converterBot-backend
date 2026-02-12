@@ -78,6 +78,7 @@ DEFAULT_SUBPROCESS_ENV = {
 
 MAX_STDERR_CHARS = int(os.getenv("MAX_STDERR_CHARS", "4096"))
 MIN_OUTPUT_BYTES = int(os.getenv("MIN_OUTPUT_BYTES", str(50 * 1024)))
+MIN_INPUT_BYTES = int(os.getenv("MIN_INPUT_BYTES", str(100 * 1024)))
 
 app = FastAPI(title="converter-service")
 
@@ -285,6 +286,19 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
     raise RuntimeError("RAW conversion failed; " + _format_raw_errors(errors))
 
 
+async def _convert_raw_or_422(
+    in_path: Path,
+    out_path: Path,
+    quality: int,
+    max_side: Optional[int],
+) -> None:
+    try:
+        _convert_raw(in_path, out_path, quality, max_side)
+        _validate_output_file(out_path)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=_truncate_stderr(f"RAW conversion failed: {exc}")) from exc
+
+
 def _is_raw_upload(suffix: str, content_type: Optional[str]) -> bool:
     normalized_suffix = suffix.lower()
     if normalized_suffix in RAW_SUFFIXES:
@@ -340,16 +354,37 @@ async def convert(
     out_path = tmpdir / "output.jpg"
 
     try:
-        in_path.write_bytes(content)
+        with open(in_path, "wb") as tmp_in:
+            tmp_in.write(content)
 
-        try:
-            if is_raw:
-                _convert_raw(in_path, out_path, quality, max_side)
-            else:
+        input_size = in_path.stat().st_size
+
+        if is_raw:
+            if input_size < MIN_INPUT_BYTES:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"RAW input too small: {input_size} bytes (min {MIN_INPUT_BYTES})",
+                )
+            print(f"raw_input path={in_path} input_size={input_size}", flush=True)
+            await _convert_raw_or_422(in_path, out_path, quality, max_side)
+            elapsed_ms = round((time.monotonic() - start) * 1000, 2)
+            print(
+                f"status=ok ext={suffix} in_bytes={size_bytes} out_bytes={out_path.stat().st_size} quality={quality} "
+                f"max_side={max_side} elapsed_ms={elapsed_ms}",
+                flush=True,
+            )
+            return FileResponse(
+                path=out_path,
+                media_type="image/jpeg",
+                filename="output.jpg",
+                background=BackgroundTask(lambda: shutil.rmtree(tmpdir, ignore_errors=True)),
+            )
+        else:
+            try:
                 _magick_to_jpeg(in_path, out_path, quality, max_side)
                 _validate_output_file(out_path)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=422, detail=_truncate_stderr(f"conversion failed: {exc}")) from exc
+            except RuntimeError as exc:
+                raise HTTPException(status_code=422, detail=_truncate_stderr(f"conversion failed: {exc}")) from exc
 
         _validate_output_file(out_path)
     except Exception:
