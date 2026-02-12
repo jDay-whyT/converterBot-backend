@@ -80,6 +80,7 @@ MAX_STDERR_CHARS = int(os.getenv("MAX_STDERR_CHARS", "4096"))
 MIN_OUTPUT_BYTES = int(os.getenv("MIN_OUTPUT_BYTES", str(50 * 1024)))
 MIN_INPUT_BYTES = int(os.getenv("MIN_INPUT_BYTES", str(100 * 1024)))
 MIN_MEAN_LUMA = float(os.getenv("MIN_MEAN_LUMA", "0.02"))
+MIN_REGION_MEAN_LUMA = float(os.getenv("MIN_REGION_MEAN_LUMA", "0.015"))
 
 app = FastAPI(title="converter-service")
 
@@ -216,18 +217,64 @@ def _mean_luma(path: Path) -> float:
         return -1.0
 
 
-def _image_ok(path: Path, min_dimension: int = 200) -> bool:
-    dims = _identify_dimensions(path)
-    if not dims:
-        print(f"img_check path={path} w=na h=na mean=na ok=0", flush=True)
-        return False
+def _region_luma(path: Path, crop: str) -> float:
+    try:
+        result = _run(
+            [
+                "magick",
+                str(path),
+                "-colorspace",
+                "Gray",
+                "-crop",
+                crop,
+                "-resize",
+                "64x64!",
+                "-format",
+                "%[fx:mean]",
+                "info:",
+            ],
+            timeout=MAGICK_TIMEOUT_SECONDS,
+        )
+        return float(result.decode("utf-8", errors="ignore").strip())
+    except Exception:
+        return -1.0
 
-    width, height = dims
-    mean = _mean_luma(path)
-    ok = width >= min_dimension and height >= min_dimension and mean >= MIN_MEAN_LUMA
-    mean_str = f"{mean:.6f}" if mean >= 0 else "na"
-    print(f"img_check path={path} w={width} h={height} mean={mean_str} ok={int(ok)}", flush=True)
+
+def _bands_ok(path: Path) -> bool:
+    full = _region_luma(path, "100%x100%")
+    left = _region_luma(path, "50%x100%+0+0")
+    right = _region_luma(path, "50%x100%+50%+0")
+    top = _region_luma(path, "100%x50%+0+0")
+    bottom = _region_luma(path, "100%x50%+0+50%")
+
+    means = (full, left, right, top, bottom)
+    ok = all(mean >= MIN_REGION_MEAN_LUMA for mean in means)
+    mean_str = lambda val: f"{val:.6f}" if val >= 0 else "na"
+    print(
+        "img_check "
+        f"mean_full={mean_str(full)} mean_l={mean_str(left)} mean_r={mean_str(right)} "
+        f"mean_t={mean_str(top)} mean_b={mean_str(bottom)} ok={int(ok)}",
+        flush=True,
+    )
     return ok
+
+
+def _image_fail_reason(path: Path, min_dimension: int = 200) -> Optional[str]:
+    if not _identify_ok(path, min_dimension=min_dimension):
+        return "identify_failed"
+
+    mean = _mean_luma(path)
+    if mean < MIN_MEAN_LUMA:
+        return "mean_failed"
+
+    if not _bands_ok(path):
+        return "band_check_failed"
+
+    return None
+
+
+def _image_ok(path: Path, min_dimension: int = 200) -> bool:
+    return _image_fail_reason(path, min_dimension=min_dimension) is None
 
 
 def _find_decoded_raw_path(input_path: Path) -> Path:
@@ -288,14 +335,16 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
                 if proc.returncode != 0:
                     raise CommandExecutionError("exiftool", proc.returncode, stderr or "preview extraction failed")
                 _validate_output_file(preview_path)
-                if not _image_ok(preview_path):
-                    _record_fail(f"exiftool:{preview_tag}", "image check failed for extracted preview")
+                fail_reason = _image_fail_reason(preview_path)
+                if fail_reason:
+                    _record_fail(f"exiftool:{preview_tag}", fail_reason)
                     preview_path.unlink(missing_ok=True)
                     continue
                 _magick_to_jpeg(preview_path, output_path, quality, max_side)
                 _validate_output_file(output_path)
-                if not _image_ok(output_path):
-                    _record_fail(f"exiftool:{preview_tag}", "image check failed for output jpeg")
+                fail_reason = _image_fail_reason(output_path)
+                if fail_reason:
+                    _record_fail(f"exiftool:{preview_tag}", fail_reason)
                     continue
                 print(f"raw_step=exiftool:{preview_tag} status=ok reason=preview_extracted", flush=True)
                 return
@@ -328,12 +377,16 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
                 "opencl=false",
             ], timeout=DARKTABLE_TIMEOUT_SECONDS, env_overrides={"DARKTABLE_NUM_THREADS": "1"})
             _validate_output_file(darktable_jpg)
-            if not _image_ok(darktable_jpg):
-                raise RuntimeError("image check failed for darktable output")
+            fail_reason = _image_fail_reason(darktable_jpg)
+            if fail_reason:
+                _record_fail("darktable-cli", fail_reason)
+                return
             _magick_to_jpeg(darktable_jpg, output_path, quality, max_side)
             _validate_output_file(output_path)
-            if not _image_ok(output_path):
-                raise RuntimeError("image check failed for output jpeg")
+            fail_reason = _image_fail_reason(output_path)
+            if fail_reason:
+                _record_fail("darktable-cli", fail_reason)
+                return
             print("raw_step=darktable-cli status=ok reason=render_success", flush=True)
             return
         except CommandExecutionError as exc:
@@ -349,12 +402,16 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
             _run(["dcraw_emu", *decode_cmd], timeout=DCRAW_TIMEOUT_SECONDS)
             generated = _find_decoded_raw_path(input_path)
             _validate_output_file(generated)
-            if not _image_ok(generated):
-                raise RuntimeError("image check failed for decoded image")
+            fail_reason = _image_fail_reason(generated)
+            if fail_reason:
+                _record_fail("dcraw_emu", fail_reason)
+                return
             _magick_to_jpeg(generated, output_path, quality, max_side)
             _validate_output_file(output_path)
-            if not _image_ok(output_path):
-                raise RuntimeError("image check failed for output jpeg")
+            fail_reason = _image_fail_reason(output_path)
+            if fail_reason:
+                _record_fail("dcraw_emu", fail_reason)
+                return
             print("raw_step=dcraw_emu status=ok reason=decode_success", flush=True)
             return
         except CommandExecutionError as exc:
@@ -370,12 +427,16 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
             _run(["dcraw", *decode_cmd], timeout=DCRAW_TIMEOUT_SECONDS)
             generated = _find_decoded_raw_path(input_path)
             _validate_output_file(generated)
-            if not _image_ok(generated):
-                raise RuntimeError("image check failed for decoded image")
+            fail_reason = _image_fail_reason(generated)
+            if fail_reason:
+                _record_fail("dcraw", fail_reason)
+                return
             _magick_to_jpeg(generated, output_path, quality, max_side)
             _validate_output_file(output_path)
-            if not _image_ok(output_path):
-                raise RuntimeError("image check failed for output jpeg")
+            fail_reason = _image_fail_reason(output_path)
+            if fail_reason:
+                _record_fail("dcraw", fail_reason)
+                return
             print("raw_step=dcraw status=ok reason=decode_success", flush=True)
             return
         except CommandExecutionError as exc:
