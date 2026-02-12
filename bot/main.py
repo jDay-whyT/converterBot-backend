@@ -18,7 +18,28 @@ from batching import BatchProgress, BatchRegistry
 from config import Settings, load_settings
 from telegram_retry import ProgressDebouncer, TelegramFileSemaphore, telegram_api_retry
 
-SUPPORTED_EXTENSIONS = {".heic", ".dng", ".webp", ".tif", ".tiff"}
+SUPPORTED_EXTENSIONS = {
+    ".heic",
+    ".heif",
+    ".dng",
+    ".webp",
+    ".tif",
+    ".tiff",
+    ".cr2",
+    ".cr3",
+}
+SUPPORTED_MIME_TYPES = {
+    "image/heif",
+    "image/heic",
+    "image/x-canon-cr2",
+    "image/x-canon-cr3",
+}
+MIME_TO_EXT = {
+    "image/heif": ".heif",
+    "image/heic": ".heic",
+    "image/x-canon-cr2": ".cr2",
+    "image/x-canon-cr3": ".cr3",
+}
 
 
 def format_ms(seconds: float | None) -> int | None:
@@ -154,8 +175,22 @@ class ConversionBot:
         assert message.from_user and message.document
         document = message.document
         ext = Path(document.file_name or "").suffix.lower()
+        mime_type = (document.mime_type or "").lower()
+        if not ext and mime_type in SUPPORTED_MIME_TYPES:
+            ext = MIME_TO_EXT.get(mime_type, "")
         if ext not in SUPPORTED_EXTENSIONS:
+            logging.info(
+                "ignored_file filename=%s ext=%s mime=%s size=%s",
+                document.file_name or "",
+                ext,
+                document.mime_type or "",
+                document.file_size,
+            )
             return
+
+        file_name = document.file_name or document.file_id
+        if not Path(file_name).suffix:
+            file_name = f"{file_name}{ext}"
 
         size_limit = self.settings.max_file_mb * 1024 * 1024
         batch = self.registry.get_or_create(
@@ -170,7 +205,6 @@ class ConversionBot:
             return
 
         async with self.semaphore:
-            file_name = document.file_name or document.file_id
             user_id = message.from_user.id
             chat_id = message.chat.id
             in_bytes = 0
@@ -188,7 +222,7 @@ class ConversionBot:
                     raise RuntimeError("httpx.AsyncClient not initialized. Call start() before processing documents.")
 
                 with tempfile.TemporaryDirectory(prefix="tg-file-") as tmpdir:
-                    source = Path(tmpdir) / (document.file_name or "input.bin")
+                    source = Path(tmpdir) / file_name
                     file_info = await telegram_api_retry(
                         self.bot.get_file,
                         document.file_id,
@@ -218,7 +252,7 @@ class ConversionBot:
                 if not jpg_bytes or len(jpg_bytes) < 100:
                     raise ValueError(f"Invalid jpg data: {len(jpg_bytes) if jpg_bytes else 0} bytes")
 
-                target_name = f"{Path(document.file_name or 'file').stem}.jpg"
+                target_name = f"{Path(file_name).stem}.jpg"
                 logging.info(f"Sending {target_name} to Telegram: {len(jpg_bytes)} bytes")
 
                 upload_started = perf_counter()
