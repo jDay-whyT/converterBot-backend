@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -60,11 +61,63 @@ RAW_MIME_TYPES = {
 }
 
 ALLOWED_SUFFIXES = {".heic", ".heif", ".webp", ".tif", ".tiff", *RAW_SUFFIXES}
+RAW_DECODE_SUFFIXES = (".tiff", ".tif", ".ppm", ".pgm")
+
+SUBPROCESS_TIMEOUT_SECONDS = int(os.getenv("SUBPROCESS_TIMEOUT_SECONDS", "90"))
+MAGICK_TIMEOUT_SECONDS = int(os.getenv("MAGICK_TIMEOUT_SECONDS", "90"))
+DCRAW_TIMEOUT_SECONDS = int(os.getenv("DCRAW_TIMEOUT_SECONDS", "120"))
+DARKTABLE_TIMEOUT_SECONDS = int(os.getenv("DARKTABLE_TIMEOUT_SECONDS", "180"))
+
+DEFAULT_SUBPROCESS_ENV = {
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+}
+
+MAX_STDERR_CHARS = int(os.getenv("MAX_STDERR_CHARS", "4096"))
 
 app = FastAPI(title="converter-service")
 
 
-def _run(cmd: list[str], input_bytes: bytes | None = None) -> bytes:
+@dataclass
+class CommandError:
+    tool: str
+    returncode: Optional[int]
+    stderr: str
+    timeout: bool
+
+
+class CommandExecutionError(RuntimeError):
+    def __init__(self, tool: str, returncode: Optional[int], stderr: str, timeout: bool = False):
+        self.tool = tool
+        self.returncode = returncode
+        self.stderr = stderr
+        self.timeout = timeout
+        kind = "timeout" if timeout else "failed"
+        super().__init__(f"{tool} {kind}: {stderr}")
+
+
+def _truncate_stderr(stderr: str, limit: int = MAX_STDERR_CHARS) -> str:
+    cleaned = stderr.strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[:limit]}...[truncated {len(cleaned) - limit} chars]"
+
+
+def _run(
+    cmd: list[str],
+    input_bytes: bytes | None = None,
+    timeout: int = SUBPROCESS_TIMEOUT_SECONDS,
+    env_overrides: Optional[dict[str, str]] = None,
+    return_stderr: bool = False,
+) -> bytes | tuple[bytes, str]:
+    tool = cmd[0]
+    env = os.environ.copy()
+    env.update(DEFAULT_SUBPROCESS_ENV)
+    if env_overrides:
+        env.update(env_overrides)
+
     try:
         proc = subprocess.run(
             cmd,
@@ -72,19 +125,34 @@ def _run(cmd: list[str], input_bytes: bytes | None = None) -> bytes:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            timeout=timeout,
+            env=env,
         )
     except FileNotFoundError as exc:
-        raise RuntimeError(f"command not found: {cmd[0]}") from exc
+        raise CommandExecutionError(tool=tool, returncode=None, stderr="command not found") from exc
+    except subprocess.TimeoutExpired as exc:
+        stderr = _truncate_stderr((exc.stderr or b"").decode("utf-8", errors="ignore") or f"timeout after {timeout}s")
+        raise CommandExecutionError(tool=tool, returncode=None, stderr=stderr, timeout=True) from exc
+
+    stderr = _truncate_stderr(proc.stderr.decode("utf-8", errors="ignore") or "")
 
     if proc.returncode != 0:
-        stderr = proc.stderr.decode("utf-8", errors="ignore").strip()
-        raise RuntimeError(stderr or f"command failed: {' '.join(cmd)}")
+        raise CommandExecutionError(
+            tool=tool,
+            returncode=proc.returncode,
+            stderr=stderr or f"command failed: {' '.join(cmd)}",
+        )
+    if return_stderr:
+        return proc.stdout, stderr
     return proc.stdout
 
 
-def _convert_with_magick(input_path: Path, output_path: Path, quality: int, max_side: Optional[int]) -> None:
+def _magick_to_jpeg(input_path: Path, output_path: Path, quality: int, max_side: Optional[int]) -> None:
     cmd = [
         "magick",
+        "-limit",
+        "thread",
+        "1",
         str(input_path),
         "-auto-orient",
         "-colorspace",
@@ -93,62 +161,81 @@ def _convert_with_magick(input_path: Path, output_path: Path, quality: int, max_
     if max_side:
         cmd.extend(["-resize", f"{max_side}x{max_side}>"])
     cmd.extend(["-quality", str(quality), "-strip", str(output_path)])
-    _run(cmd)
+    _run(cmd, timeout=MAGICK_TIMEOUT_SECONDS)
 
 
-def _magick_to_jpeg(input_path: Path, output_path: Path, quality: int, max_side: Optional[int]) -> None:
-    cmd = ["magick", str(input_path), "-auto-orient", "-colorspace", "sRGB"]
-    if max_side:
-        cmd.extend(["-resize", f"{max_side}x{max_side}>"])
-    cmd.extend(["-quality", str(quality), "-strip", str(output_path)])
-    _run(cmd)
+def _find_decoded_raw_path(input_path: Path) -> Path:
+    candidates: list[Path] = []
+    for suffix in RAW_DECODE_SUFFIXES:
+        direct = input_path.with_suffix(suffix)
+        if direct.exists() and direct.is_file():
+            candidates.append(direct)
+    if candidates:
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+
+    pattern = f"{input_path.stem}*"
+    for candidate in input_path.parent.glob(pattern):
+        if candidate.suffix.lower() in RAW_DECODE_SUFFIXES and candidate.is_file():
+            candidates.append(candidate)
+
+    if not candidates:
+        raise RuntimeError(f"decoded RAW output not found for {input_path.name}")
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _format_raw_errors(errors: list[CommandError]) -> str:
+    parts = []
+    for err in errors:
+        timeout = " timeout=1" if err.timeout else ""
+        returncode = "na" if err.returncode is None else str(err.returncode)
+        parts.append(f"{err.tool} rc={returncode}{timeout} err={err.stderr}")
+    return " | ".join(parts)
 
 
 def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Optional[int]) -> None:
-    errors: list[str] = []
+    errors: list[CommandError] = []
     decode_cmd = ["-T", "-w", "-q", "3", "-H", "0", str(input_path)]
 
     # 1) dcraw_emu -> TIFF, then magick -> JPG
-    dcraw_emu_tiff = input_path.with_name("raw_dcraw_emu.tiff")
     if shutil.which("dcraw_emu") is None:
-        errors.append("dcraw_emu: command not found")
+        errors.append(CommandError(tool="dcraw_emu", returncode=None, stderr="command not found", timeout=False))
     else:
         try:
-            _run(["dcraw_emu", *decode_cmd])
-            generated = input_path.with_suffix(".tiff")
-            if not generated.exists():
-                raise RuntimeError(f"expected decoded TIFF not found: {generated}")
-            if generated != dcraw_emu_tiff:
-                generated.rename(dcraw_emu_tiff)
-            _magick_to_jpeg(dcraw_emu_tiff, output_path, quality, max_side)
+            _run(["dcraw_emu", *decode_cmd], timeout=DCRAW_TIMEOUT_SECONDS)
+            generated = _find_decoded_raw_path(input_path)
+            _magick_to_jpeg(generated, output_path, quality, max_side)
             return
+        except CommandExecutionError as exc:
+            print(
+                f"raw_step=dcraw_emu status=fail timeout={int(exc.timeout)} rc={exc.returncode} stderr={exc.stderr}",
+                flush=True,
+            )
+            errors.append(CommandError(tool="dcraw_emu", returncode=exc.returncode, stderr=exc.stderr, timeout=exc.timeout))
         except Exception as exc:
-            stderr = str(exc).strip()
-            print(f"raw_step=dcraw_emu status=fail reason={stderr}", flush=True)
-            errors.append(f"dcraw_emu: {stderr}")
+            stderr = _truncate_stderr(str(exc))
+            print(f"raw_step=dcraw_emu status=fail timeout=0 rc=na stderr={stderr}", flush=True)
+            errors.append(CommandError(tool="dcraw_emu", returncode=None, stderr=stderr, timeout=False))
 
     # 2) dcraw -> TIFF, then magick -> JPG
-    dcraw_tiff = input_path.with_name("raw_dcraw.tiff")
     if shutil.which("dcraw") is None:
-        errors.append("dcraw: command not found")
+        errors.append(CommandError(tool="dcraw", returncode=None, stderr="command not found", timeout=False))
     else:
         try:
-            _run(["dcraw", *decode_cmd])
-            generated = input_path.with_suffix(".tiff")
-            if not generated.exists():
-                raise RuntimeError(f"expected decoded TIFF not found: {generated}")
-            if generated != dcraw_tiff:
-                generated.rename(dcraw_tiff)
-            _magick_to_jpeg(dcraw_tiff, output_path, quality, max_side)
+            _run(["dcraw", *decode_cmd], timeout=DCRAW_TIMEOUT_SECONDS)
+            generated = _find_decoded_raw_path(input_path)
+            _magick_to_jpeg(generated, output_path, quality, max_side)
             return
+        except CommandExecutionError as exc:
+            print(f"raw_step=dcraw status=fail timeout={int(exc.timeout)} rc={exc.returncode} stderr={exc.stderr}", flush=True)
+            errors.append(CommandError(tool="dcraw", returncode=exc.returncode, stderr=exc.stderr, timeout=exc.timeout))
         except Exception as exc:
-            stderr = str(exc).strip()
-            print(f"raw_step=dcraw status=fail reason={stderr}", flush=True)
-            errors.append(f"dcraw: {stderr}")
+            stderr = _truncate_stderr(str(exc))
+            print(f"raw_step=dcraw status=fail timeout=0 rc=na stderr={stderr}", flush=True)
+            errors.append(CommandError(tool="dcraw", returncode=None, stderr=stderr, timeout=False))
 
     # 3) darktable-cli -> jpg directly
     if shutil.which("darktable-cli") is None:
-        errors.append("darktable-cli: command not found")
+        errors.append(CommandError(tool="darktable-cli", returncode=None, stderr="command not found", timeout=False))
     else:
         try:
             darktable_jpg = input_path.with_name("raw_darktable.jpg")
@@ -161,24 +248,40 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
                 "plugins/imageio/format/jpeg/quality=95",
                 "--conf",
                 "plugins/imageio/format/jpeg/allow_upscale=false",
-            ])
+                "--conf",
+                "opencl=false",
+            ], timeout=DARKTABLE_TIMEOUT_SECONDS, env_overrides={"DARKTABLE_NUM_THREADS": "1"})
             _magick_to_jpeg(darktable_jpg, output_path, quality, max_side)
             return
+        except CommandExecutionError as exc:
+            print(
+                f"raw_step=darktable-cli status=fail timeout={int(exc.timeout)} rc={exc.returncode} stderr={exc.stderr}",
+                flush=True,
+            )
+            errors.append(
+                CommandError(tool="darktable-cli", returncode=exc.returncode, stderr=exc.stderr, timeout=exc.timeout)
+            )
         except Exception as exc:
-            stderr = str(exc).strip()
-            print(f"raw_step=darktable status=fail reason={stderr}", flush=True)
-            errors.append(f"darktable-cli: {stderr}")
+            stderr = _truncate_stderr(str(exc))
+            print(f"raw_step=darktable-cli status=fail timeout=0 rc=na stderr={stderr}", flush=True)
+            errors.append(CommandError(tool="darktable-cli", returncode=None, stderr=stderr, timeout=False))
 
-    raise RuntimeError("RAW conversion failed; " + " | ".join(errors))
+    raise RuntimeError("RAW conversion failed; " + _format_raw_errors(errors))
 
 
 def _is_raw_upload(suffix: str, content_type: Optional[str]) -> bool:
-    if suffix in RAW_SUFFIXES:
+    normalized_suffix = suffix.lower()
+    if normalized_suffix in RAW_SUFFIXES:
         return True
+
+    if normalized_suffix in (ALLOWED_SUFFIXES - RAW_SUFFIXES):
+        return False
+
     if not content_type:
         return False
+
     ct = content_type.lower()
-    return ct in RAW_MIME_TYPES or ct.startswith(RAW_MIME_PREFIXES)
+    return ct in RAW_MIME_TYPES or any(ct.startswith(prefix) for prefix in RAW_MIME_PREFIXES)
 
 
 @app.get("/health")
@@ -200,7 +303,8 @@ async def convert(
 
     filename = file.filename or "input.bin"
     suffix = Path(filename).suffix.lower()
-    if suffix not in ALLOWED_SUFFIXES:
+    is_raw = _is_raw_upload(suffix, file.content_type)
+    if suffix not in ALLOWED_SUFFIXES and not (not suffix and is_raw):
         raise HTTPException(status_code=400, detail="unsupported file extension")
 
     if quality < 1 or quality > 100:
@@ -215,17 +319,18 @@ async def convert(
         raise HTTPException(status_code=413, detail=f"file too large: max {MAX_FILE_MB}MB")
 
     with tempfile.TemporaryDirectory(prefix="convert-") as tmpdir:
-        in_path = Path(tmpdir) / f"input{suffix}"
+        effective_suffix = suffix or (".dng" if is_raw else ".bin")
+        in_path = Path(tmpdir) / f"input{effective_suffix}"
         out_path = Path(tmpdir) / "output.jpg"
         in_path.write_bytes(content)
 
         try:
-            if _is_raw_upload(suffix, file.content_type):
+            if is_raw:
                 _convert_raw(in_path, out_path, quality, max_side)
             else:
-                _convert_with_magick(in_path, out_path, quality, max_side)
+                _magick_to_jpeg(in_path, out_path, quality, max_side)
         except RuntimeError as exc:
-            raise HTTPException(status_code=422, detail=f"conversion failed: {exc}") from exc
+            raise HTTPException(status_code=422, detail=_truncate_stderr(f"conversion failed: {exc}")) from exc
 
         if not out_path.exists() or out_path.stat().st_size == 0:
             raise HTTPException(status_code=500, detail="conversion failed: empty output")
@@ -252,11 +357,11 @@ def _check_tools() -> None:
 
     # Check for libheif support in ImageMagick
     try:
-        result = _run(["magick", "-list", "format"])
+        result, _ = _run(["magick", "-list", "format"], return_stderr=True)
         formats = result.decode("utf-8", errors="ignore")
         if "HEIC" not in formats and "HEIF" not in formats:
             missing.append("libheif(HEIC/HEIF)")
-    except (RuntimeError, FileNotFoundError):
+    except RuntimeError:
         pass
 
     if missing:

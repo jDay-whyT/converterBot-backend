@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     imagemagick \
     libheif1 \
+    libheif-plugin-libde265 \
     libde265-0 \
     libjpeg62-turbo \
     liblcms2-2 \
@@ -23,5 +24,11 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py ./
+
+RUN groupadd --system appuser \
+    && useradd --system --gid appuser --create-home --shell /usr/sbin/nologin appuser \
+    && chown -R appuser:appuser /app
+
+USER appuser
 
 CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT}"]
