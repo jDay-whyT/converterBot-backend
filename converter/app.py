@@ -32,6 +32,33 @@ RAW_SUFFIXES = {
     ".mrw",
 }
 
+RAW_MIME_PREFIXES = (
+    "image/x-",
+    "image/raw",
+    "image/dng",
+    "image/prs.adobe.dng",
+)
+
+RAW_MIME_TYPES = {
+    "image/x-adobe-dng",
+    "image/x-canon-cr2",
+    "image/x-canon-cr3",
+    "image/x-nikon-nef",
+    "image/x-nikon-nrw",
+    "image/x-sony-arw",
+    "image/x-fuji-raf",
+    "image/x-panasonic-rw2",
+    "image/x-olympus-orf",
+    "image/x-pentax-pef",
+    "image/x-samsung-srw",
+    "image/x-sigma-x3f",
+    "image/x-hasselblad-3fr",
+    "image/x-phaseone-iiq",
+    "image/x-kodak-dcr",
+    "image/x-kodak-kdc",
+    "image/x-minolta-mrw",
+}
+
 ALLOWED_SUFFIXES = {".heic", ".heif", ".webp", ".tif", ".tiff", *RAW_SUFFIXES}
 
 app = FastAPI(title="converter-service")
@@ -69,28 +96,89 @@ def _convert_with_magick(input_path: Path, output_path: Path, quality: int, max_
     _run(cmd)
 
 
-def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Optional[int]) -> None:
-    # Try dcraw_emu (libraw-bin) first - better DNG/ProRAW support, then fallback to dcraw
-    decode_cmd = ["-c", "-w", "-q", "3", "-H", "0", str(input_path)]
-    raw: bytes | None = None
-
-    if shutil.which("dcraw_emu") is not None:
-        try:
-            raw = _run(["dcraw_emu", *decode_cmd])
-        except (RuntimeError, FileNotFoundError):
-            raw = None
-
-    if raw is None:
-        try:
-            raw = _run(["dcraw", *decode_cmd])
-        except (RuntimeError, FileNotFoundError) as exc:
-            raise RuntimeError("Cannot decode RAW (libraw/dcraw not available)") from exc
-
-    cmd = ["magick", "-", "-auto-orient", "-colorspace", "sRGB"]
+def _magick_to_jpeg(input_path: Path, output_path: Path, quality: int, max_side: Optional[int]) -> None:
+    cmd = ["magick", str(input_path), "-auto-orient", "-colorspace", "sRGB"]
     if max_side:
         cmd.extend(["-resize", f"{max_side}x{max_side}>"])
     cmd.extend(["-quality", str(quality), "-strip", str(output_path)])
-    _run(cmd, input_bytes=raw)
+    _run(cmd)
+
+
+def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Optional[int]) -> None:
+    errors: list[str] = []
+    decode_cmd = ["-T", "-w", "-q", "3", "-H", "0", str(input_path)]
+
+    # 1) dcraw_emu -> TIFF, then magick -> JPG
+    dcraw_emu_tiff = input_path.with_name("raw_dcraw_emu.tiff")
+    if shutil.which("dcraw_emu") is None:
+        errors.append("dcraw_emu: command not found")
+    else:
+        try:
+            _run(["dcraw_emu", *decode_cmd])
+            generated = input_path.with_suffix(".tiff")
+            if not generated.exists():
+                raise RuntimeError(f"expected decoded TIFF not found: {generated}")
+            if generated != dcraw_emu_tiff:
+                generated.rename(dcraw_emu_tiff)
+            _magick_to_jpeg(dcraw_emu_tiff, output_path, quality, max_side)
+            return
+        except Exception as exc:
+            stderr = str(exc).strip()
+            print(f"raw_step=dcraw_emu status=fail reason={stderr}", flush=True)
+            errors.append(f"dcraw_emu: {stderr}")
+
+    # 2) dcraw -> TIFF, then magick -> JPG
+    dcraw_tiff = input_path.with_name("raw_dcraw.tiff")
+    if shutil.which("dcraw") is None:
+        errors.append("dcraw: command not found")
+    else:
+        try:
+            _run(["dcraw", *decode_cmd])
+            generated = input_path.with_suffix(".tiff")
+            if not generated.exists():
+                raise RuntimeError(f"expected decoded TIFF not found: {generated}")
+            if generated != dcraw_tiff:
+                generated.rename(dcraw_tiff)
+            _magick_to_jpeg(dcraw_tiff, output_path, quality, max_side)
+            return
+        except Exception as exc:
+            stderr = str(exc).strip()
+            print(f"raw_step=dcraw status=fail reason={stderr}", flush=True)
+            errors.append(f"dcraw: {stderr}")
+
+    # 3) darktable-cli -> jpg directly
+    if shutil.which("darktable-cli") is None:
+        errors.append("darktable-cli: command not found")
+    else:
+        try:
+            darktable_jpg = input_path.with_name("raw_darktable.jpg")
+            _run([
+                "darktable-cli",
+                str(input_path),
+                str(darktable_jpg),
+                "--core",
+                "--conf",
+                "plugins/imageio/format/jpeg/quality=95",
+                "--conf",
+                "plugins/imageio/format/jpeg/allow_upscale=false",
+            ])
+            _magick_to_jpeg(darktable_jpg, output_path, quality, max_side)
+            return
+        except Exception as exc:
+            stderr = str(exc).strip()
+            print(f"raw_step=darktable status=fail reason={stderr}", flush=True)
+            errors.append(f"darktable-cli: {stderr}")
+
+    raise RuntimeError("RAW conversion failed; " + " | ".join(errors))
+
+
+def _is_raw_upload(suffix: str, content_type: Optional[str]) -> bool:
+    if suffix in RAW_SUFFIXES:
+        return True
+    if not content_type:
+        return False
+    ct = content_type.lower()
+    return ct in RAW_MIME_TYPES or ct.startswith(RAW_MIME_PREFIXES)
 
 
 @app.get("/health")
@@ -132,7 +220,7 @@ async def convert(
         in_path.write_bytes(content)
 
         try:
-            if suffix in RAW_SUFFIXES:
+            if _is_raw_upload(suffix, file.content_type):
                 _convert_raw(in_path, out_path, quality, max_side)
             else:
                 _convert_with_magick(in_path, out_path, quality, max_side)
@@ -159,6 +247,8 @@ def _check_tools() -> None:
     missing = [tool for tool in ("magick",) if shutil.which(tool) is None]
     if shutil.which("dcraw_emu") is None and shutil.which("dcraw") is None:
         missing.append("dcraw_emu|dcraw")
+    if shutil.which("darktable-cli") is None:
+        missing.append("darktable-cli")
 
     # Check for libheif support in ImageMagick
     try:
