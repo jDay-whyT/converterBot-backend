@@ -2,7 +2,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from config import Settings, _parse_allowed, _required, load_settings
+from config import Settings, _parse_allowed, _required, load_settings, normalize_converter_url
 
 
 class ConfigTests(unittest.TestCase):
@@ -65,7 +65,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(settings.chat_id, -100123)
             self.assertEqual(settings.topic_source_id, 10)
             self.assertEqual(settings.topic_converted_id, 20)
-            self.assertEqual(settings.converter_url, "https://example.com")
+            self.assertEqual(settings.converter_url, "https://example.com/convert")
             self.assertEqual(settings.converter_api_key, "secret")
             self.assertEqual(settings.max_file_mb, 40)
             self.assertEqual(settings.batch_window_seconds, 120)
@@ -89,6 +89,21 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(settings.max_file_mb, 50)
             self.assertEqual(settings.batch_window_seconds, 60)
             self.assertEqual(settings.progress_update_every, 5)
+
+    def test_normalize_converter_url_adds_convert(self) -> None:
+        self.assertEqual(normalize_converter_url("https://example.com"), "https://example.com/convert")
+
+    def test_normalize_converter_url_keeps_convert_suffix(self) -> None:
+        self.assertEqual(
+            normalize_converter_url("https://example.com/convert"),
+            "https://example.com/convert",
+        )
+
+    def test_normalize_converter_url_trims_and_deduplicates_convert(self) -> None:
+        self.assertEqual(
+            normalize_converter_url("  https://example.com/convert/convert/  "),
+            "https://example.com/convert",
+        )
 
 
 if __name__ == "__main__":
