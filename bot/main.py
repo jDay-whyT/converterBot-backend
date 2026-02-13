@@ -508,15 +508,19 @@ async def _main() -> None:
     try:
         health_runner = await start_health_server(health_host, health_port, app)
 
-        webhook_url = f"{settings.bot_url}/telegram/webhook"
-        try:
-            await app.bot.set_webhook(
-                url=webhook_url,
-                secret_token=settings.tg_webhook_secret,
-            )
-            logging.info("Telegram webhook configured: %s", webhook_url)
-        except Exception:  # noqa: BLE001
-            logging.exception("Failed to configure Telegram webhook: %s", webhook_url)
+        url = os.getenv("BOT_URL", "").rstrip("/")
+        if not url:
+            logging.error("BOT_URL is empty, skip setWebhook")
+        else:
+            webhook_url = f"{url}/telegram/webhook"
+            try:
+                await app.bot.set_webhook(
+                    url=webhook_url,
+                    secret_token=settings.tg_webhook_secret,
+                )
+                logging.info("Telegram webhook configured: %s", webhook_url)
+            except Exception:  # noqa: BLE001
+                logging.exception("Failed to configure Telegram webhook: %s", webhook_url)
 
         # Wait for shutdown signal
         await shutdown_event.wait()
