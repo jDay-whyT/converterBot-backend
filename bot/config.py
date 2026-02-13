@@ -27,6 +27,8 @@ def normalize_converter_url(raw: str) -> str:
 @dataclass(frozen=True)
 class Settings:
     bot_token: str
+    bot_url: str
+    tg_webhook_secret: str
     allowed_editors: set[int]
     chat_id: int
     topic_source_id: int
@@ -57,6 +59,8 @@ def load_settings() -> Settings:
 
     return Settings(
         bot_token=_required("BOT_TOKEN"),
+        bot_url=_required("BOT_URL").rstrip("/"),
+        tg_webhook_secret=_required("TG_WEBHOOK_SECRET"),
         allowed_editors=allowed_editors,
         chat_id=int(_required("CHAT_ID")),
         topic_source_id=int(_required("TOPIC_SOURCE_ID")),

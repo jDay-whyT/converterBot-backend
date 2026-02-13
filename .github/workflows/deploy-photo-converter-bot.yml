@@ -216,6 +216,7 @@ jobs:
           CONVERTER_API_KEY: ${{ secrets.CONVERTER_API_KEY }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          BOT_URL: ${{ vars.BOT_URL }}
           ALLOWED_EDITORS: ${{ vars.ALLOWED_EDITORS }}
           CHAT_ID: ${{ vars.CHAT_ID }}
           TOPIC_SOURCE_ID: ${{ vars.TOPIC_SOURCE_ID }}
@@ -230,6 +231,7 @@ jobs:
             GCP_REGION
             CLOUD_RUN_BOT_SERVICE
             CONVERTER_API_KEY
+            BOT_URL
             ALLOWED_EDITORS
             CHAT_ID
             TOPIC_SOURCE_ID
@@ -407,8 +409,11 @@ jobs:
             CHAT_ID=${{ vars.CHAT_ID }}
             TOPIC_SOURCE_ID=${{ vars.TOPIC_SOURCE_ID }}
             TOPIC_CONVERTED_ID=${{ vars.TOPIC_CONVERTED_ID }}
+            BOT_URL=${{ vars.BOT_URL }}
             CONVERTER_URL=${{ steps.get_converter_url.outputs.converter_url }}
             CONVERTER_API_KEY=${{ secrets.CONVERTER_API_KEY }}
             MAX_FILE_MB=${{ vars.MAX_FILE_MB || '40' }}
             BATCH_WINDOW_SECONDS=${{ vars.BATCH_WINDOW_SECONDS }}
             PROGRESS_UPDATE_EVERY=${{ vars.PROGRESS_UPDATE_EVERY }}
+          flags: >-
+            --set-secrets=TG_WEBHOOK_SECRET=TG_WEBHOOK_SECRET:latest
