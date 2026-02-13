@@ -444,8 +444,8 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
     return web.Response(status=200, text="ok")
 
 
-async def run_health_server(host: str, port: int, bot_app: ConversionBot) -> None:
-    """Run HTTP health check server for Cloud Run."""
+async def start_health_server(host: str, port: int, bot_app: ConversionBot) -> web.AppRunner:
+    """Start HTTP health check server for Cloud Run."""
     app = web.Application()
     app["bot_app"] = bot_app  # Store reference to initialized bot
     app.router.add_get("/", handle_root)
@@ -458,12 +458,7 @@ async def run_health_server(host: str, port: int, bot_app: ConversionBot) -> Non
     await site.start()
 
     logging.info(f"Health server listening on {host}:{port}")
-
-    # Keep running indefinitely
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await runner.cleanup()
+    return runner
 
 
 async def _main() -> None:
@@ -500,20 +495,19 @@ async def _main() -> None:
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    # Initialize task references
-    health_task = None
+    health_runner = None
     try:
-        webhook_url = f"{settings.bot_url}/telegram/webhook"
-        await app.bot.set_webhook(
-            url=webhook_url,
-            secret_token=settings.tg_webhook_secret,
-        )
-        logging.info("Telegram webhook configured: %s", webhook_url)
+        health_runner = await start_health_server(health_host, health_port, app)
 
-        # Start health server with initialized bot reference
-        health_task = asyncio.create_task(run_health_server(health_host, health_port, app))
-        await asyncio.sleep(0.5)  # Give health server a moment to start listening
-        logging.info("Health server started")
+        webhook_url = f"{settings.bot_url}/telegram/webhook"
+        try:
+            await app.bot.set_webhook(
+                url=webhook_url,
+                secret_token=settings.tg_webhook_secret,
+            )
+            logging.info("Telegram webhook configured: %s", webhook_url)
+        except Exception:  # noqa: BLE001
+            logging.exception("Failed to configure Telegram webhook: %s", webhook_url)
 
         # Wait for shutdown signal
         await shutdown_event.wait()
@@ -521,14 +515,8 @@ async def _main() -> None:
     except Exception as exc:
         logging.error(f"Error in main loop: {exc}", exc_info=True)
     finally:
-        # Cancel and gather only existing tasks
-        tasks = [t for t in [health_task] if t is not None]
-        for task in tasks:
-            task.cancel()
-
-        # Wait for tasks to complete cancellation
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        if health_runner is not None:
+            await health_runner.cleanup()
 
         # Cleanup resources in proper order
         await app.stop()  # Close httpx client
