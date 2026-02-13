@@ -435,8 +435,17 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
     if bot_app is None:
         return web.Response(status=503, text="bot not initialized")
 
-    secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-    if not secret_header or secret_header != bot_app.settings.tg_webhook_secret:
+    expected = os.getenv("TG_WEBHOOK_SECRET", "")
+    got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    logging.info(
+        "webhook auth check: expected_present=%s expected_len=%d got_present=%s got_len=%d match=%s",
+        bool(expected),
+        len(expected),
+        bool(got),
+        len(got),
+        got == expected,
+    )
+    if not got or got != expected:
         return web.Response(status=401, text="unauthorized")
 
     update_payload = await request.json()
