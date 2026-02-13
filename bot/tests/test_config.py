@@ -57,6 +57,8 @@ class ConfigTests(unittest.TestCase):
             "TOPIC_CONVERTED_ID": "20",
             "CONVERTER_URL": "https://example.com/",
             "CONVERTER_API_KEY": "secret",
+            "BOT_URL": "https://bot.example.com/",
+            "TG_WEBHOOK_SECRET": "webhook-secret",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = load_settings()
@@ -67,6 +69,8 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(settings.topic_converted_id, 20)
             self.assertEqual(settings.converter_url, "https://example.com/convert")
             self.assertEqual(settings.converter_api_key, "secret")
+            self.assertEqual(settings.bot_url, "https://bot.example.com")
+            self.assertEqual(settings.tg_webhook_secret, "webhook-secret")
             self.assertEqual(settings.max_file_mb, 40)
             self.assertEqual(settings.batch_window_seconds, 120)
             self.assertEqual(settings.progress_update_every, 3)
@@ -80,6 +84,8 @@ class ConfigTests(unittest.TestCase):
             "TOPIC_CONVERTED_ID": "2",
             "CONVERTER_URL": "http://localhost:8080",
             "CONVERTER_API_KEY": "key",
+            "BOT_URL": "https://bot.example.com",
+            "TG_WEBHOOK_SECRET": "secret",
             "MAX_FILE_MB": "50",
             "BATCH_WINDOW_SECONDS": "60",
             "PROGRESS_UPDATE_EVERY": "5",

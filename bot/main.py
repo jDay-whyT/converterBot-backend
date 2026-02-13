@@ -12,7 +12,7 @@ import httpx
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import BufferedInputFile, Message, Update
 
 from batching import BatchProgress, BatchRegistry
 from config import Settings, load_settings
@@ -409,10 +409,6 @@ class ConversionBot:
             ignore_message_not_modified=True,
         )
 
-    async def run(self) -> None:
-        await self.dp.start_polling(self.bot)
-
-
 async def handle_root(request: web.Request) -> web.Response:
     """Health check endpoint for Cloud Run."""
     bot_app = request.app.get("bot_app")
@@ -429,12 +425,32 @@ async def handle_healthz(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "bot_ready": True})
 
 
+async def _process_telegram_update(bot_app: ConversionBot, raw_update: dict) -> None:
+    update = Update.model_validate(raw_update, context={"bot": bot_app.bot})
+    await bot_app.dp.feed_update(bot_app.bot, update)
+
+
+async def handle_telegram_webhook(request: web.Request) -> web.Response:
+    bot_app = request.app.get("bot_app")
+    if bot_app is None:
+        return web.Response(status=503, text="bot not initialized")
+
+    secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if not secret_header or secret_header != bot_app.settings.tg_webhook_secret:
+        return web.Response(status=401, text="unauthorized")
+
+    update_payload = await request.json()
+    asyncio.create_task(_process_telegram_update(bot_app, update_payload))
+    return web.Response(status=200, text="ok")
+
+
 async def run_health_server(host: str, port: int, bot_app: ConversionBot) -> None:
     """Run HTTP health check server for Cloud Run."""
     app = web.Application()
     app["bot_app"] = bot_app  # Store reference to initialized bot
     app.router.add_get("/", handle_root)
     app.router.add_get("/healthz", handle_healthz)
+    app.router.add_post("/telegram/webhook", handle_telegram_webhook)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -486,17 +502,18 @@ async def _main() -> None:
 
     # Initialize task references
     health_task = None
-    polling_task = None
-
     try:
+        webhook_url = f"{settings.bot_url}/telegram/webhook"
+        await app.bot.set_webhook(
+            url=webhook_url,
+            secret_token=settings.tg_webhook_secret,
+        )
+        logging.info("Telegram webhook configured: %s", webhook_url)
+
         # Start health server with initialized bot reference
         health_task = asyncio.create_task(run_health_server(health_host, health_port, app))
         await asyncio.sleep(0.5)  # Give health server a moment to start listening
         logging.info("Health server started")
-
-        # Start bot polling
-        polling_task = asyncio.create_task(app.run())
-        logging.info("Bot polling started")
 
         # Wait for shutdown signal
         await shutdown_event.wait()
@@ -505,7 +522,7 @@ async def _main() -> None:
         logging.error(f"Error in main loop: {exc}", exc_info=True)
     finally:
         # Cancel and gather only existing tasks
-        tasks = [t for t in [health_task, polling_task] if t is not None]
+        tasks = [t for t in [health_task] if t is not None]
         for task in tasks:
             task.cancel()
 
