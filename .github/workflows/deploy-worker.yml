@@ -1,0 +1,187 @@
+name: Deploy worker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AR_REPO: orochimary
+  WORKER_IMAGE_NAME: photo-convert-worker
+
+jobs:
+  deploy_worker:
+    name: Deploy worker
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required configuration
+        shell: bash
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          GCP_WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
+          GCP_SA_EMAIL: ${{ secrets.GCP_SA_EMAIL }}
+          GCP_REGION: ${{ secrets.GCP_REGION }}
+          CLOUD_RUN_WORKER_SERVICE: ${{ secrets.CLOUD_RUN_WORKER_SERVICE }}
+          CONVERTER_API_KEY: ${{ secrets.CONVERTER_API_KEY }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ vars.CHAT_ID }}
+          TOPIC_CONVERTED_ID: ${{ vars.TOPIC_CONVERTED_ID }}
+        run: |
+          set -euo pipefail
+
+          required=(
+            GCP_PROJECT
+            GCP_WIF_PROVIDER
+            GCP_SA_EMAIL
+            GCP_REGION
+            CLOUD_RUN_WORKER_SERVICE
+            CONVERTER_API_KEY
+            CHAT_ID
+            TOPIC_CONVERTED_ID
+          )
+
+          for key in "${required[@]}"; do
+            if [[ -z "${!key:-}" ]]; then
+              echo "Missing required secret or variable: $key" >&2
+              exit 1
+            fi
+          done
+
+          if [[ -z "${BOT_TOKEN:-}" && -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+            echo "Missing required secret: BOT_TOKEN or TELEGRAM_BOT_TOKEN" >&2
+            exit 1
+          fi
+
+      - name: Normalize and validate image/repo names
+        id: names
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ar_repo_lower="$(echo "${AR_REPO}" | tr '[:upper:]' '[:lower:]')"
+          worker_image_lower="$(echo "${WORKER_IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
+
+          validate_re='^[a-z0-9]+([._-][a-z0-9]+)*$'
+          for value in "$ar_repo_lower" "$worker_image_lower"; do
+            if [[ ! "$value" =~ $validate_re ]]; then
+              echo "Invalid Artifact Registry/image name: $value" >&2
+              exit 1
+            fi
+          done
+
+          echo "ar_repo=$ar_repo_lower" >> "$GITHUB_OUTPUT"
+          echo "worker_image=$worker_image_lower" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        shell: bash
+        run: |
+          gcloud auth configure-docker "${{ secrets.GCP_REGION }}-docker.pkg.dev" --quiet
+
+      - name: Build and push worker image
+        id: build_push_worker
+        shell: bash
+        env:
+          PROJECT_ID: ${{ secrets.GCP_PROJECT }}
+          REGION: ${{ secrets.GCP_REGION }}
+        run: |
+          set -euo pipefail
+
+          image_uri="${REGION}-docker.pkg.dev/${PROJECT_ID}/${{ steps.names.outputs.ar_repo }}/${{ steps.names.outputs.worker_image }}:${GITHUB_SHA}"
+
+          echo "::group::Building Docker image"
+          echo "Building image: $image_uri"
+          if ! docker build -t "$image_uri" ./worker; then
+            echo "::error::Docker build failed"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Pushing Docker image"
+          echo "Pushing image: $image_uri"
+
+          # Retry logic for docker push (network operation)
+          max_attempts=4
+          attempt=1
+          backoff=2
+
+          while [ $attempt -le $max_attempts ]; do
+            echo "Push attempt $attempt of $max_attempts..."
+
+            if docker push "$image_uri"; then
+              echo "Successfully pushed image"
+              echo "::endgroup::"
+              break
+            else
+              if [ $attempt -eq $max_attempts ]; then
+                echo "::error::Failed to push image after $max_attempts attempts"
+                exit 1
+              fi
+
+              echo "Push failed, waiting ${backoff}s before retry..."
+              sleep $backoff
+              backoff=$((backoff * 2))
+              attempt=$((attempt + 1))
+            fi
+          done
+
+          echo "image_uri=$image_uri" >> "$GITHUB_OUTPUT"
+
+      - name: Get converter URL
+        id: get_converter_url
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          converter_url="$(gcloud run services describe "${{ secrets.CLOUD_RUN_CONVERTER_SERVICE }}" \
+            --region="${{ secrets.GCP_REGION }}" \
+            --project="${{ secrets.GCP_PROJECT }}" \
+            --format='value(status.url)')"
+
+          if [[ -z "$converter_url" ]]; then
+            echo "Failed to resolve converter URL" >&2
+            exit 1
+          fi
+
+          echo "Converter URL: $converter_url"
+          echo "converter_url=$converter_url" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy worker to Cloud Run
+        id: deploy_worker
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ secrets.CLOUD_RUN_WORKER_SERVICE }}
+          region: ${{ secrets.GCP_REGION }}
+          image: ${{ steps.build_push_worker.outputs.image_uri }}
+          env_vars: |
+            BOT_TOKEN=${{ secrets.BOT_TOKEN != '' && secrets.BOT_TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
+            CHAT_ID=${{ vars.CHAT_ID }}
+            TOPIC_CONVERTED_ID=${{ vars.TOPIC_CONVERTED_ID }}
+            CONVERTER_URL=${{ steps.get_converter_url.outputs.converter_url }}
+            CONVERTER_API_KEY=${{ secrets.CONVERTER_API_KEY }}
+            MAX_FILE_MB=${{ vars.MAX_FILE_MB || '40' }}
+            CONVERSION_TIMEOUT_SECONDS=600
+          flags: >-
+            --min-instances=0
+            --max-instances=2
+            --cpu=1
+            --memory=1Gi
+            --concurrency=1
+            --timeout=600
+            --cpu-throttling
+            --allow-unauthenticated

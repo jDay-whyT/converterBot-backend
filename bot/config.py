@@ -35,6 +35,9 @@ class Settings:
     topic_converted_id: int
     converter_url: str
     converter_api_key: str
+    gcp_project: str
+    pubsub_topic: str
+    enable_webhook_setup: bool = False
     max_file_mb: int = 40
     batch_window_seconds: int = 120
     progress_update_every: int = 3
@@ -57,6 +60,9 @@ def load_settings() -> Settings:
             "Format: comma, pipe, or space-separated user IDs (e.g., '123456789,987654321')"
         )
 
+    enable_webhook_setup_str = os.getenv("ENABLE_WEBHOOK_SETUP", "false").strip().lower()
+    enable_webhook_setup = enable_webhook_setup_str == "true"
+
     return Settings(
         bot_token=_required("BOT_TOKEN"),
         bot_url=_required("BOT_URL").rstrip("/"),
@@ -67,6 +73,9 @@ def load_settings() -> Settings:
         topic_converted_id=int(_required("TOPIC_CONVERTED_ID")),
         converter_url=normalize_converter_url(_required("CONVERTER_URL")),
         converter_api_key=_required("CONVERTER_API_KEY"),
+        gcp_project=_required("GCP_PROJECT"),
+        pubsub_topic=_required("PUBSUB_TOPIC"),
+        enable_webhook_setup=enable_webhook_setup,
         max_file_mb=int(os.getenv("MAX_FILE_MB", "40")),
         batch_window_seconds=int(os.getenv("BATCH_WINDOW_SECONDS", "120")),
         progress_update_every=int(os.getenv("PROGRESS_UPDATE_EVERY", "3")),
