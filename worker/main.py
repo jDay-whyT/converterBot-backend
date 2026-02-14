@@ -10,6 +10,7 @@ from time import perf_counter
 
 import httpx
 from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BufferedInputFile
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -23,6 +24,10 @@ _settings: Settings | None = None
 _bot: Bot | None = None
 _http_client: httpx.AsyncClient | None = None
 _processed_jobs: set[str] = set()  # Simple in-memory deduplication
+
+
+def _is_file_too_big_error(exc: TelegramBadRequest) -> bool:
+    return "file is too big" in str(exc).lower()
 
 
 def format_ms(seconds: float | None) -> int | None:
@@ -140,6 +145,20 @@ async def pubsub_push(request: Request) -> JSONResponse:
         logging.info("Job completed successfully: %s", idempotency_key)
         return JSONResponse({"status": "success", "key": idempotency_key}, status_code=200)
 
+    except TelegramBadRequest as exc:
+        if _is_file_too_big_error(exc):
+            logging.warning("ACK job due to Telegram size limit: %s", exc)
+            _processed_jobs.add(idempotency_key)
+            try:
+                await _bot.send_message(chat_id=chat_id, text="Файл слишком большой, лимит 20MB у Bot API")
+            except Exception as notify_exc:  # noqa: BLE001
+                logging.warning("Failed to notify chat about 20MB limit: %s", notify_exc)
+            return JSONResponse(
+                {"status": "skipped", "reason": "telegram_file_too_big", "key": idempotency_key},
+                status_code=200,
+            )
+        logging.exception("Job processing failed with TelegramBadRequest: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Processing failed: {exc}") from exc
     except Exception as exc:
         logging.exception("Job processing failed: %s", exc)
         # Return 5xx to trigger Pub/Sub retry
