@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -13,6 +14,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, Message, Update
+from google.cloud import pubsub_v1
 
 from batching import BatchProgress, BatchRegistry
 from config import Settings, load_settings
@@ -27,18 +29,36 @@ SUPPORTED_EXTENSIONS = {
     ".tiff",
     ".cr2",
     ".cr3",
+    ".arw",
+    ".nef",
+    ".nrw",
+    ".raf",
+    ".rw2",
+    ".orf",
 }
 SUPPORTED_MIME_TYPES = {
     "image/heif",
     "image/heic",
     "image/x-canon-cr2",
     "image/x-canon-cr3",
+    "image/x-sony-arw",
+    "image/x-nikon-nef",
+    "image/x-nikon-nrw",
+    "image/x-fuji-raf",
+    "image/x-panasonic-rw2",
+    "image/x-olympus-orf",
 }
 MIME_TO_EXT = {
     "image/heif": ".heif",
     "image/heic": ".heic",
     "image/x-canon-cr2": ".cr2",
     "image/x-canon-cr3": ".cr3",
+    "image/x-sony-arw": ".arw",
+    "image/x-nikon-nef": ".nef",
+    "image/x-nikon-nrw": ".nrw",
+    "image/x-fuji-raf": ".raf",
+    "image/x-panasonic-rw2": ".rw2",
+    "image/x-olympus-orf": ".orf",
 }
 PHOTO_MIME_TO_EXT = {
     "image/heif": ".heif",
@@ -439,26 +459,94 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
     got_raw = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
     expected = expected_raw.strip()
     got = got_raw.strip()
-    logging.info(
-        "webhook auth check: expected_present=%s expected_len=%d got_present=%s got_len=%d match=%s",
-        bool(expected),
-        len(expected),
-        bool(got),
-        len(got),
-        got == expected,
-    )
     if not expected or got != expected:
         return web.Response(status=401, text="unauthorized")
 
     update_payload = await request.json()
-    asyncio.create_task(_process_telegram_update(bot_app, update_payload))
+
+    # Check if update_id is present
+    if "update_id" not in update_payload:
+        logging.info("webhook_received: no update_id in payload, ignoring")
+        return web.Response(status=200, text="ok")
+
+    # Extract file info from update
+    file_id = None
+    file_unique_id = None
+    chat_id = None
+    message_id = None
+    mime_type = None
+    file_name = None
+
+    try:
+        # Try to extract from message
+        message = update_payload.get("message", {})
+        if message:
+            chat_id = message.get("chat", {}).get("id")
+            message_id = message.get("message_id")
+
+            # Check for document
+            document = message.get("document")
+            if document:
+                file_id = document.get("file_id")
+                file_unique_id = document.get("file_unique_id")
+                mime_type = document.get("mime_type")
+                file_name = document.get("file_name")
+
+            # Check for photo
+            photos = message.get("photo", [])
+            if photos and not file_id:
+                photo = photos[-1]  # Get largest photo
+                file_id = photo.get("file_id")
+                file_unique_id = photo.get("file_unique_id")
+
+        # If we have file info, publish to Pub/Sub
+        if file_id and chat_id and message_id:
+            publisher = request.app.get("pubsub_publisher")
+            topic_path = request.app.get("pubsub_topic_path")
+
+            if publisher and topic_path:
+                job_data = {
+                    "file_id": file_id,
+                    "file_unique_id": file_unique_id,
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "mime_type": mime_type,
+                    "file_name": file_name,
+                    "update_id": update_payload.get("update_id"),
+                }
+
+                message_json = json.dumps(job_data)
+                message_bytes = message_json.encode("utf-8")
+
+                # Publish to Pub/Sub (async)
+                future = publisher.publish(topic_path, message_bytes)
+                logging.info(
+                    "pubsub_published file_id=%s file_unique_id=%s chat_id=%s message_id=%s",
+                    file_id, file_unique_id, chat_id, message_id
+                )
+            else:
+                logging.warning("pubsub_publisher or topic_path not configured")
+        else:
+            logging.debug("webhook_received: no file info found in update")
+
+    except Exception as exc:
+        logging.exception("Error processing webhook for Pub/Sub: %s", exc)
+
     return web.Response(status=200, text="ok")
 
 
-async def start_health_server(host: str, port: int, bot_app: ConversionBot) -> web.AppRunner:
+async def start_health_server(
+    host: str,
+    port: int,
+    bot_app: ConversionBot,
+    pubsub_publisher: pubsub_v1.PublisherClient | None,
+    pubsub_topic_path: str | None,
+) -> web.AppRunner:
     """Start HTTP health check server for Cloud Run."""
     app = web.Application()
     app["bot_app"] = bot_app  # Store reference to initialized bot
+    app["pubsub_publisher"] = pubsub_publisher
+    app["pubsub_topic_path"] = pubsub_topic_path
     app.router.add_get("/", handle_root)
     app.router.add_get("/healthz", handle_healthz)
     app.router.add_post("/telegram/webhook", handle_telegram_webhook)
@@ -485,6 +573,17 @@ async def _main() -> None:
         logging.error("Bot cannot start due to missing or invalid environment variables")
         raise SystemExit(1) from exc
 
+    # Initialize Pub/Sub publisher
+    pubsub_publisher = None
+    pubsub_topic_path = None
+    try:
+        pubsub_publisher = pubsub_v1.PublisherClient()
+        pubsub_topic_path = pubsub_publisher.topic_path(settings.gcp_project, settings.pubsub_topic)
+        logging.info("Pub/Sub publisher initialized: topic=%s", pubsub_topic_path)
+    except Exception as exc:
+        logging.exception("Failed to initialize Pub/Sub publisher: %s", exc)
+        raise SystemExit(1) from exc
+
     # Initialize bot
     app = ConversionBot(settings)
     logging.info("Bot initialized successfully")
@@ -508,21 +607,27 @@ async def _main() -> None:
 
     health_runner = None
     try:
-        health_runner = await start_health_server(health_host, health_port, app)
+        health_runner = await start_health_server(
+            health_host, health_port, app, pubsub_publisher, pubsub_topic_path
+        )
 
-        url = os.getenv("BOT_URL", "").rstrip("/")
-        if not url:
-            logging.error("BOT_URL is empty, skip setWebhook")
+        # Only setup webhook if ENABLE_WEBHOOK_SETUP is true
+        if settings.enable_webhook_setup:
+            url = os.getenv("BOT_URL", "").rstrip("/")
+            if not url:
+                logging.error("BOT_URL is empty, skip setWebhook")
+            else:
+                webhook_url = f"{url}/telegram/webhook"
+                try:
+                    await app.bot.set_webhook(
+                        url=webhook_url,
+                        secret_token=settings.tg_webhook_secret,
+                    )
+                    logging.info("Telegram webhook configured: %s", webhook_url)
+                except Exception:  # noqa: BLE001
+                    logging.exception("Failed to configure Telegram webhook: %s", webhook_url)
         else:
-            webhook_url = f"{url}/telegram/webhook"
-            try:
-                await app.bot.set_webhook(
-                    url=webhook_url,
-                    secret_token=settings.tg_webhook_secret,
-                )
-                logging.info("Telegram webhook configured: %s", webhook_url)
-            except Exception:  # noqa: BLE001
-                logging.exception("Failed to configure Telegram webhook: %s", webhook_url)
+            logging.info("ENABLE_WEBHOOK_SETUP=false, skipping webhook setup")
 
         # Wait for shutdown signal
         await shutdown_event.wait()
@@ -536,6 +641,10 @@ async def _main() -> None:
         # Cleanup resources in proper order
         await app.stop()  # Close httpx client
         await app.bot.session.close()  # Close bot session last
+
+        # Cleanup Pub/Sub publisher
+        if pubsub_publisher:
+            pubsub_publisher.stop()
 
         logging.info("Graceful shutdown complete")
 

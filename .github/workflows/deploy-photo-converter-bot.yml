@@ -195,6 +195,14 @@ jobs:
           env_vars: |
             CONVERTER_API_KEY=${{ secrets.CONVERTER_API_KEY }}
             MAX_FILE_MB=${{ vars.MAX_FILE_MB || '40' }}
+          flags: >-
+            --min-instances=0
+            --max-instances=3
+            --cpu=2
+            --memory=4Gi
+            --concurrency=1
+            --timeout=600
+            --cpu-throttling
 
   deploy_bot:
     name: Deploy bot
@@ -412,8 +420,17 @@ jobs:
             BOT_URL=${{ vars.BOT_URL }}
             CONVERTER_URL=${{ steps.get_converter_url.outputs.converter_url }}
             CONVERTER_API_KEY=${{ secrets.CONVERTER_API_KEY }}
+            GCP_PROJECT=${{ secrets.GCP_PROJECT }}
+            PUBSUB_TOPIC=${{ vars.PUBSUB_TOPIC || 'tg-convert-jobs' }}
+            ENABLE_WEBHOOK_SETUP=false
             MAX_FILE_MB=${{ vars.MAX_FILE_MB || '40' }}
             BATCH_WINDOW_SECONDS=${{ vars.BATCH_WINDOW_SECONDS }}
             PROGRESS_UPDATE_EVERY=${{ vars.PROGRESS_UPDATE_EVERY }}
           flags: >-
-            --set-secrets=TG_WEBHOOK_SECRET=TG_WEBHOOK_SECRET:latest
+            --set-secrets=TG_WEBHOOK_SECRET=TG_WEBHOOK_SECRET:2
+            --min-instances=0
+            --max-instances=10
+            --cpu=1
+            --memory=512Mi
+            --concurrency=30
+            --cpu-throttling
