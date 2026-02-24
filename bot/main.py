@@ -474,6 +474,7 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
     file_unique_id = None
     chat_id = None
     message_id = None
+    message_thread_id = None
     mime_type = None
     file_name = None
 
@@ -483,6 +484,7 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
         if message:
             chat_id = message.get("chat", {}).get("id")
             message_id = message.get("message_id")
+            message_thread_id = message.get("message_thread_id")
 
             # Check for document
             document = message.get("document")
@@ -500,7 +502,10 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
                 file_unique_id = photo.get("file_unique_id")
 
         # If we have file info, publish to Pub/Sub
-        if file_id and chat_id and message_id:
+        # Only process messages from the configured chat and source topic
+        is_correct_chat = chat_id == bot_app.settings.chat_id
+        is_source_topic = message_thread_id == bot_app.settings.topic_source_id
+        if file_id and chat_id and message_id and is_correct_chat and is_source_topic:
             publisher = request.app.get("pubsub_publisher")
             topic_path = request.app.get("pubsub_topic_path")
 
