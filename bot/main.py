@@ -413,7 +413,7 @@ class ConversionBot:
             sent = await telegram_api_retry(
                 self.bot.send_message,
                 chat_id=batch.chat_id,
-                message_thread_id=batch.topic_id,
+                message_thread_id=target_topic_id,
                 text=text,
                 max_retries=2,
             )
