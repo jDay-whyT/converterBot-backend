@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -10,7 +11,7 @@ from time import perf_counter
 
 import httpx
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import BufferedInputFile
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -23,11 +24,26 @@ app = FastAPI(title="worker-service")
 _settings: Settings | None = None
 _bot: Bot | None = None
 _http_client: httpx.AsyncClient | None = None
-_processed_jobs: set[str] = set()  # Simple in-memory deduplication
+_processed_jobs: dict[str, None] = {}  # insertion-ordered for correct FIFO eviction
 
 
 def _is_file_too_big_error(exc: TelegramBadRequest) -> bool:
     return "file is too big" in str(exc).lower()
+
+
+async def _tg_retry(fn, *args, max_retries: int = 3, **kwargs):
+    for attempt in range(max_retries + 1):
+        try:
+            return await fn(*args, **kwargs)
+        except TelegramRetryAfter as exc:
+            if attempt == max_retries:
+                raise
+            sleep_time = exc.retry_after + 1
+            logging.warning(
+                "TelegramRetryAfter fn=%s attempt=%s/%s sleeping=%ss",
+                fn.__name__, attempt + 1, max_retries, sleep_time,
+            )
+            await asyncio.sleep(sleep_time)
 
 
 def format_ms(seconds: float | None) -> int | None:
@@ -109,7 +125,6 @@ async def pubsub_push(request: Request) -> JSONResponse:
     chat_id = job.get("chat_id")
     message_id = job.get("message_id")
     file_name = job.get("file_name")
-    mime_type = job.get("mime_type")
 
     if not file_id or not chat_id or not message_id:
         logging.warning("Missing required fields in job: %s", job)
@@ -133,14 +148,12 @@ async def pubsub_push(request: Request) -> JSONResponse:
         )
 
         # Mark as processed
-        _processed_jobs.add(idempotency_key)
+        _processed_jobs[idempotency_key] = None
 
-        # Limit cache size to prevent memory leak
+        # Evict oldest 5000 entries when limit reached
         if len(_processed_jobs) > 10000:
-            # Remove oldest half (simple FIFO approximation)
-            items = list(_processed_jobs)
-            _processed_jobs.clear()
-            _processed_jobs.update(items[5000:])
+            for key in list(_processed_jobs)[:5000]:
+                del _processed_jobs[key]
 
         logging.info("Job completed successfully: %s", idempotency_key)
         return JSONResponse({"status": "success", "key": idempotency_key}, status_code=200)
@@ -148,9 +161,9 @@ async def pubsub_push(request: Request) -> JSONResponse:
     except TelegramBadRequest as exc:
         if _is_file_too_big_error(exc):
             logging.warning("ACK job due to Telegram size limit: %s", exc)
-            _processed_jobs.add(idempotency_key)
+            _processed_jobs[idempotency_key] = None
             try:
-                await _bot.send_message(chat_id=chat_id, text="Файл слишком большой, лимит 20MB у Bot API")
+                await _tg_retry(_bot.send_message, chat_id=chat_id, message_thread_id=_settings.topic_converted_id, text="Файл слишком большой, лимит 20MB у Bot API")
             except Exception as notify_exc:  # noqa: BLE001
                 logging.warning("Failed to notify chat about 20MB limit: %s", notify_exc)
             return JSONResponse(
@@ -187,8 +200,8 @@ async def process_conversion_job(
             source = Path(tmpdir) / file_name
 
             download_started = perf_counter()
-            file_info = await bot.get_file(file_id)
-            await bot.download_file(file_info.file_path, destination=source)
+            file_info = await _tg_retry(bot.get_file, file_id)
+            await _tg_retry(bot.download_file, file_info.file_path, destination=source)
             tg_download_s = perf_counter() - download_started
             in_bytes = source.stat().st_size
 
@@ -235,7 +248,8 @@ async def process_conversion_job(
             target_name = f"{Path(file_name).stem}.jpg"
             upload_started = perf_counter()
 
-            await bot.send_document(
+            await _tg_retry(
+                bot.send_document,
                 chat_id=settings.chat_id,
                 message_thread_id=settings.topic_converted_id,
                 document=BufferedInputFile(jpg_bytes, filename=target_name),

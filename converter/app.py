@@ -1,3 +1,4 @@
+import asyncio
 import os
 import shutil
 import subprocess
@@ -532,15 +533,23 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
 
 
 def _convert_heif_with_fallback(input_path: Path, output_path: Path, quality: int, max_side: Optional[int]) -> None:
-    if shutil.which("heif-convert") is None:
-        raise RuntimeError("HEIF decode failed and heif-convert is unavailable")
+    if shutil.which("heif-convert") is not None:
+        try:
+            heif_tmp_jpg = input_path.with_name("heif_fallback.jpg")
+            _run(["heif-convert", str(input_path), str(heif_tmp_jpg)], timeout=SUBPROCESS_TIMEOUT_SECONDS)
+            _validate_output_file(heif_tmp_jpg)
+            if not _image_ok(heif_tmp_jpg):
+                raise RuntimeError("image check failed for heif-convert output")
+            _magick_to_jpeg(heif_tmp_jpg, output_path, quality, max_side)
+            _validate_output_file(output_path)
+            if not _image_ok(output_path):
+                raise RuntimeError("image check failed for output jpeg")
+            return
+        except (CommandExecutionError, RuntimeError) as exc:
+            print(f"heif_step=heif-convert status=fail reason={exc} falling_back_to_magick", flush=True)
 
-    heif_tmp_jpg = input_path.with_name("heif_fallback.jpg")
-    _run(["heif-convert", str(input_path), str(heif_tmp_jpg)], timeout=SUBPROCESS_TIMEOUT_SECONDS)
-    _validate_output_file(heif_tmp_jpg)
-    if not _image_ok(heif_tmp_jpg):
-        raise RuntimeError("image check failed for heif-convert output")
-    _magick_to_jpeg(heif_tmp_jpg, output_path, quality, max_side)
+    # Fallback: ImageMagick direct decode (works when libheif is installed)
+    _magick_to_jpeg(input_path, output_path, quality, max_side)
     _validate_output_file(output_path)
     if not _image_ok(output_path):
         raise RuntimeError("image check failed for output jpeg")
@@ -553,9 +562,9 @@ async def _convert_raw_or_422(
     max_side: Optional[int],
 ) -> None:
     try:
-        _convert_raw(in_path, out_path, quality, max_side)
+        await asyncio.to_thread(_convert_raw, in_path, out_path, quality, max_side)
         _validate_output_file(out_path)
-        if not _image_ok(out_path):
+        if not await asyncio.to_thread(_image_ok, out_path):
             raise RuntimeError("image check failed for output jpeg")
     except RuntimeError as exc:
         raise HTTPException(status_code=422, detail=_truncate_stderr(str(exc))) from exc
@@ -604,7 +613,7 @@ async def convert(
         input_size = in_path.stat().st_size
 
         try:
-            file_type, mime_type = _detect_filetype(in_path)
+            file_type, mime_type = await asyncio.to_thread(_detect_filetype, in_path)
             route = _decoder_route(file_type, mime_type)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=_truncate_stderr(str(exc))) from exc
@@ -647,11 +656,11 @@ async def convert(
         else:
             try:
                 if route == "heif":
-                    _convert_heif_with_fallback(in_path, out_path, quality, max_side)
+                    await asyncio.to_thread(_convert_heif_with_fallback, in_path, out_path, quality, max_side)
                 else:
-                    _magick_to_jpeg(in_path, out_path, quality, max_side)
+                    await asyncio.to_thread(_magick_to_jpeg, in_path, out_path, quality, max_side)
                 _validate_output_file(out_path)
-                if not _image_ok(out_path):
+                if not await asyncio.to_thread(_image_ok, out_path):
                     raise RuntimeError("image check failed for output jpeg")
             except RuntimeError as exc:
                 raise HTTPException(status_code=422, detail=_truncate_stderr(f"conversion failed: {exc}")) from exc

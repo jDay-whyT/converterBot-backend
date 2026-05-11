@@ -5,429 +5,19 @@ import json
 import logging
 import os
 import signal
-import tempfile
-from time import perf_counter
-from pathlib import Path
 
-import httpx
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, Message, Update
+from aiogram import Bot
 from google.cloud import pubsub_v1
 
-from batching import BatchProgress, BatchRegistry
 from config import Settings, load_settings
-from telegram_retry import ProgressDebouncer, TelegramFileSemaphore, telegram_api_retry
-
-SUPPORTED_EXTENSIONS = {
-    ".heic",
-    ".heif",
-    ".dng",
-    ".webp",
-    ".tif",
-    ".tiff",
-    ".cr2",
-    ".cr3",
-    ".arw",
-    ".nef",
-    ".nrw",
-    ".raf",
-    ".rw2",
-    ".orf",
-}
-SUPPORTED_MIME_TYPES = {
-    "image/heif",
-    "image/heic",
-    "image/x-canon-cr2",
-    "image/x-canon-cr3",
-    "image/x-sony-arw",
-    "image/x-nikon-nef",
-    "image/x-nikon-nrw",
-    "image/x-fuji-raf",
-    "image/x-panasonic-rw2",
-    "image/x-olympus-orf",
-}
-MIME_TO_EXT = {
-    "image/heif": ".heif",
-    "image/heic": ".heic",
-    "image/x-canon-cr2": ".cr2",
-    "image/x-canon-cr3": ".cr3",
-    "image/x-sony-arw": ".arw",
-    "image/x-nikon-nef": ".nef",
-    "image/x-nikon-nrw": ".nrw",
-    "image/x-fuji-raf": ".raf",
-    "image/x-panasonic-rw2": ".rw2",
-    "image/x-olympus-orf": ".orf",
-}
-PHOTO_MIME_TO_EXT = {
-    "image/heif": ".heif",
-    "image/heic": ".heic",
-}
-
-
-def format_ms(seconds: float | None) -> int | None:
-    if seconds is None:
-        return None
-    return int(seconds * 1000)
-
-
-class ConverterClient:
-    def __init__(self, settings: Settings):
-        self.settings = settings
-
-    async def convert(
-        self, path: Path, client: httpx.AsyncClient, quality: int = 92, max_side: int | None = None
-    ) -> tuple[bytes, int | None]:
-        files = {"file": (path.name, path.read_bytes(), "application/octet-stream")}
-        data: dict[str, str | int] = {"quality": quality}
-        if max_side:
-            data["max_side"] = max_side
-
-        headers = {"X-API-KEY": self.settings.converter_api_key}
-        final_url = self.settings.converter_url
-        file_size = path.stat().st_size
-        logging.info("converter_post url=%s filename=%s size=%s", final_url, path.name, file_size)
-
-        request_started = perf_counter()
-        response = await client.post(
-            final_url,
-            headers=headers,
-            files=files,
-            data=data,
-        )
-        request_elapsed = perf_counter() - request_started
-        logging.info(
-            "converter_request file=%s status=%s request_ms=%s",
-            path.name,
-            response.status_code,
-            format_ms(request_elapsed),
-        )
-        if response.status_code != 200:
-            body_preview = response.text[:2048]
-            logging.error(
-                "converter_response_error url=%s status_code=%s body=%s",
-                final_url,
-                response.status_code,
-                body_preview,
-            )
-        response.raise_for_status()
-
-        # Validate response content size
-        content_size = len(response.content)
-        logging.info(f"Converted {path.name}: received {content_size} bytes")
-
-        if content_size < 100:
-            raise ValueError(f"Converted file too small: {content_size} bytes (expected at least 100)")
-
-        return response.content, response.status_code
 
 
 class ConversionBot:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.bot = Bot(token=settings.bot_token)
-        self.dp = Dispatcher()
-        self.registry = BatchRegistry(settings.batch_window_seconds)
-        self.converter = ConverterClient(settings)
-        self.semaphore = asyncio.Semaphore(2)
-        self.file_send_lock = TelegramFileSemaphore()
-        self.progress_debouncer = ProgressDebouncer(min_interval=3.0, min_files=3)
-        self._http_client: httpx.AsyncClient | None = None
-        self._bind_handlers()
 
-    def _bind_handlers(self) -> None:
-        self.dp.message.register(self._start, Command("start"))
-        self.dp.message.register(self._handle_document, F.document)
-        self.dp.message.register(self._handle_photo, F.photo)
-
-    async def start(self) -> None:
-        """Initialize resources before starting the bot."""
-        logging.info("Initializing httpx.AsyncClient with connection pooling")
-        self._http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(self.settings.conversion_timeout_seconds),
-            limits=httpx.Limits(
-                max_connections=10,  # Maximum total connections
-                max_keepalive_connections=5,  # Keep-alive pool size
-            ),
-        )
-        logging.info("httpx.AsyncClient initialized successfully")
-
-    async def stop(self) -> None:
-        """Cleanup resources during graceful shutdown."""
-        if self._http_client is not None:
-            logging.info("Closing httpx.AsyncClient")
-            await self._http_client.aclose()
-            self._http_client = None
-            logging.info("httpx.AsyncClient closed successfully")
-
-    async def _start(self, message: Message) -> None:
-        if not self._is_allowed_user(message):
-            await telegram_api_retry(
-                message.answer,
-                "Нет доступа",
-                max_retries=2,
-            )
-            return
-        await telegram_api_retry(
-            message.answer,
-            "Switch with heic, dng, webp, tif, tiff to JPG",
-            max_retries=2,
-        )
-
-    def _is_allowed_user(self, message: Message) -> bool:
-        user = message.from_user
-        return bool(user and user.id in self.settings.allowed_editors)
-
-    def _is_source_topic(self, message: Message) -> bool:
-        return (
-            message.chat.id == self.settings.chat_id
-            and message.message_thread_id == self.settings.topic_source_id
-        )
-
-    async def _handle_document(self, message: Message) -> None:
-        if not self._is_allowed_user(message):
-            await telegram_api_retry(
-                message.answer,
-                "Нет доступа",
-                max_retries=2,
-            )
-            return
-
-        if not self._is_source_topic(message):
-            return
-
-        assert message.from_user and message.document
-        document = message.document
-        ext = Path(document.file_name or "").suffix.lower()
-        mime_type = (document.mime_type or "").lower()
-        if not ext and mime_type in SUPPORTED_MIME_TYPES:
-            ext = MIME_TO_EXT.get(mime_type, "")
-        if ext not in SUPPORTED_EXTENSIONS:
-            logging.info(
-                "ignored_file filename=%s ext=%s mime=%s size=%s",
-                document.file_name or "",
-                ext,
-                document.mime_type or "",
-                document.file_size,
-            )
-            return
-
-        file_name = document.file_name or document.file_id
-        if not Path(file_name).suffix:
-            file_name = f"{file_name}{ext}"
-
-        await self._handle_file_pipeline(
-            message=message,
-            file_id=document.file_id,
-            file_name=file_name,
-            report_name=document.file_name or "file",
-            file_size=document.file_size,
-        )
-
-    async def _handle_photo(self, message: Message) -> None:
-        if not self._is_allowed_user(message):
-            await telegram_api_retry(
-                message.answer,
-                "Нет доступа",
-                max_retries=2,
-            )
-            return
-
-        if not self._is_source_topic(message):
-            return
-
-        assert message.photo
-        photo = message.photo[-1]
-        ext = self._resolve_photo_extension(photo)
-        file_name = f"{photo.file_id}{ext}"
-
-        await self._handle_file_pipeline(
-            message=message,
-            file_id=photo.file_id,
-            file_name=file_name,
-            report_name=file_name,
-            file_size=photo.file_size,
-        )
-
-    def _resolve_photo_extension(self, photo: object) -> str:
-        mime_type = (getattr(photo, "mime_type", None) or "").lower()
-        if not mime_type and hasattr(photo, "model_extra"):
-            model_extra = getattr(photo, "model_extra") or {}
-            mime_type = str(model_extra.get("mime_type", "")).lower()
-        return PHOTO_MIME_TO_EXT.get(mime_type, ".jpg")
-
-    async def _handle_file_pipeline(
-        self,
-        message: Message,
-        file_id: str,
-        file_name: str,
-        report_name: str,
-        file_size: int | None,
-    ) -> None:
-
-        size_limit = self.settings.max_file_mb * 1024 * 1024
-        batch = self.registry.get_or_create(
-            chat_id=message.chat.id,
-            topic_id=message.message_thread_id or 0,
-            user_id=message.from_user.id,
-        )
-        batch.total += 1
-
-        if file_size and file_size > size_limit:
-            await self._register_result(batch, False, report_name, "слишком большой файл")
-            return
-
-        async with self.semaphore:
-            user_id = message.from_user.id
-            chat_id = message.chat.id
-            in_bytes = 0
-            out_bytes = 0
-            tg_download_s: float | None = None
-            convert_s: float | None = None
-            tg_upload_s: float | None = None
-            total_started = perf_counter()
-            converter_status_code: int | None = None
-            result = "ok"
-            ok = False
-            reason: str | None = None
-            try:
-                if self._http_client is None:
-                    raise RuntimeError("httpx.AsyncClient not initialized. Call start() before processing documents.")
-
-                with tempfile.TemporaryDirectory(prefix="tg-file-") as tmpdir:
-                    source = Path(tmpdir) / file_name
-                    file_info = await telegram_api_retry(
-                        self.bot.get_file,
-                        file_id,
-                        max_retries=2,
-                    )
-
-                    download_started = perf_counter()
-                    await telegram_api_retry(
-                        self.bot.download_file,
-                        file_info.file_path,
-                        destination=source,
-                        max_retries=2,
-                    )
-                    tg_download_s = perf_counter() - download_started
-                    in_bytes = source.stat().st_size
-
-                    convert_started = perf_counter()
-                    jpg_bytes, converter_status_code = await self.converter.convert(
-                        source,
-                        self._http_client,
-                        quality=self.settings.conversion_quality,
-                    )
-                    convert_s = perf_counter() - convert_started
-                    out_bytes = len(jpg_bytes)
-
-                # Validate jpg_bytes before sending
-                if not jpg_bytes or len(jpg_bytes) < 100:
-                    raise ValueError(f"Invalid jpg data: {len(jpg_bytes) if jpg_bytes else 0} bytes")
-
-                target_name = f"{Path(file_name).stem}.jpg"
-                logging.info(f"Sending {target_name} to Telegram: {len(jpg_bytes)} bytes")
-
-                upload_started = perf_counter()
-                async with self.file_send_lock:
-                    await telegram_api_retry(
-                        self.bot.send_document,
-                        chat_id=self.settings.chat_id,
-                        message_thread_id=self.settings.topic_converted_id,
-                        document=BufferedInputFile(jpg_bytes, filename=target_name),
-                        max_retries=2,
-                    )
-                tg_upload_s = perf_counter() - upload_started
-                ok = True
-            except httpx.HTTPStatusError as exc:
-                converter_status_code = exc.response.status_code if exc.response is not None else None
-                reason = exc.response.text[:120] if exc.response is not None else str(exc)
-                result = "error"
-            except Exception as exc:  # noqa: BLE001
-                reason = str(exc)
-                result = "error"
-            finally:
-                await self._register_result(batch, ok, report_name, reason)
-                total_s = perf_counter() - total_started
-                short_reason = (reason or "").replace("\n", " ")[:120] or "-"
-                logging.info(
-                    "file_pipeline file=%s user_id=%s chat_id=%s tg_download_ms=%s convert_ms=%s "
-                    "tg_upload_ms=%s total_ms=%s in_bytes=%s out_bytes=%s converter_status_code=%s "
-                    "result=%s reason=%s",
-                    file_name,
-                    user_id,
-                    chat_id,
-                    format_ms(tg_download_s),
-                    format_ms(convert_s),
-                    format_ms(tg_upload_s),
-                    format_ms(total_s),
-                    in_bytes,
-                    out_bytes,
-                    converter_status_code,
-                    result,
-                    short_reason,
-                )
-
-    async def _register_result(self, batch: BatchProgress, ok: bool, file_name: str, reason: str | None) -> None:
-        async with batch.lock:
-            batch.processed += 1
-            if ok:
-                batch.success += 1
-            else:
-                batch.failed += 1
-                if reason:
-                    batch.errors.append(f"ошибка на файле {file_name} ({reason})")
-
-            # Use progress debouncer to avoid spamming Telegram API
-            batch_id = id(batch)
-            current_time = perf_counter()
-            needs_update = self.progress_debouncer.should_update(
-                batch_id=batch_id,
-                processed=batch.processed,
-                total=batch.total,
-                has_error=not ok,
-                current_time=current_time,
-            )
-            if needs_update:
-                try:
-                    await self._update_progress(batch)
-                except Exception as exc:  # noqa: BLE001
-                    logging.warning("Failed to update progress message: %s", exc)
-
-            # Clean up debouncer state when batch is complete
-            if batch.processed == batch.total:
-                self.progress_debouncer.reset(batch_id)
-
-    async def _update_progress(self, batch: BatchProgress) -> None:
-        text_lines = [
-            f"Обработано: {batch.processed}/{batch.total}",
-            f"Успешно: {batch.success}",
-            f"Ошибок: {batch.failed}",
-        ]
-        if batch.errors:
-            text_lines.extend(batch.errors[-5:])
-        text = "\n".join(text_lines)
-
-        if batch.progress_message_id is None:
-            sent = await telegram_api_retry(
-                self.bot.send_message,
-                chat_id=batch.chat_id,
-                message_thread_id=target_topic_id,
-                text=text,
-                max_retries=2,
-            )
-            batch.progress_message_id = sent.message_id
-            return
-
-        await telegram_api_retry(
-            self.bot.edit_message_text,
-            chat_id=batch.chat_id,
-            message_id=batch.progress_message_id,
-            text=text,
-            max_retries=2,
-            ignore_message_not_modified=True,
-        )
 
 async def handle_root(request: web.Request) -> web.Response:
     """Health check endpoint for Cloud Run."""
@@ -445,11 +35,6 @@ async def handle_healthz(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "bot_ready": True})
 
 
-async def _process_telegram_update(bot_app: ConversionBot, raw_update: dict) -> None:
-    update = Update.model_validate(raw_update, context={"bot": bot_app.bot})
-    await bot_app.dp.feed_update(bot_app.bot, update)
-
-
 async def handle_telegram_webhook(request: web.Request) -> web.Response:
     bot_app = request.app.get("bot_app")
     if bot_app is None:
@@ -464,29 +49,27 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
 
     update_payload = await request.json()
 
-    # Check if update_id is present
     if "update_id" not in update_payload:
         logging.info("webhook_received: no update_id in payload, ignoring")
         return web.Response(status=200, text="ok")
 
-    # Extract file info from update
     file_id = None
     file_unique_id = None
     chat_id = None
     message_id = None
     message_thread_id = None
+    from_user_id = None
     mime_type = None
     file_name = None
 
     try:
-        # Try to extract from message
         message = update_payload.get("message", {})
         if message:
             chat_id = message.get("chat", {}).get("id")
             message_id = message.get("message_id")
             message_thread_id = message.get("message_thread_id")
+            from_user_id = message.get("from", {}).get("id")
 
-            # Check for document
             document = message.get("document")
             if document:
                 file_id = document.get("file_id")
@@ -494,43 +77,41 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
                 mime_type = document.get("mime_type")
                 file_name = document.get("file_name")
 
-            # Check for photo
             photos = message.get("photo", [])
             if photos and not file_id:
-                photo = photos[-1]  # Get largest photo
+                photo = photos[-1]
                 file_id = photo.get("file_id")
                 file_unique_id = photo.get("file_unique_id")
 
-        # If we have file info, publish to Pub/Sub
-        # Only process messages from the configured chat and source topic
         is_correct_chat = chat_id == bot_app.settings.chat_id
         is_source_topic = message_thread_id == bot_app.settings.topic_source_id
+        is_allowed = from_user_id in bot_app.settings.allowed_editors
         if file_id and chat_id and message_id and is_correct_chat and is_source_topic:
-            publisher = request.app.get("pubsub_publisher")
-            topic_path = request.app.get("pubsub_topic_path")
-
-            if publisher and topic_path:
-                job_data = {
-                    "file_id": file_id,
-                    "file_unique_id": file_unique_id,
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "mime_type": mime_type,
-                    "file_name": file_name,
-                    "update_id": update_payload.get("update_id"),
-                }
-
-                message_json = json.dumps(job_data)
-                message_bytes = message_json.encode("utf-8")
-
-                # Publish to Pub/Sub (async)
-                future = publisher.publish(topic_path, message_bytes)
-                logging.info(
-                    "pubsub_published file_id=%s file_unique_id=%s chat_id=%s message_id=%s",
-                    file_id, file_unique_id, chat_id, message_id
-                )
+            if not is_allowed:
+                logging.info("webhook_ignored user_id=%s not in allowed_editors", from_user_id)
             else:
-                logging.warning("pubsub_publisher or topic_path not configured")
+                publisher = request.app.get("pubsub_publisher")
+                topic_path = request.app.get("pubsub_topic_path")
+
+                if publisher and topic_path:
+                    job_data = {
+                        "file_id": file_id,
+                        "file_unique_id": file_unique_id,
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "mime_type": mime_type,
+                        "file_name": file_name,
+                        "update_id": update_payload.get("update_id"),
+                    }
+
+                    message_bytes = json.dumps(job_data).encode("utf-8")
+                    publisher.publish(topic_path, message_bytes)
+                    logging.info(
+                        "pubsub_published file_id=%s file_unique_id=%s chat_id=%s message_id=%s",
+                        file_id, file_unique_id, chat_id, message_id,
+                    )
+                else:
+                    logging.warning("pubsub_publisher or topic_path not configured")
         else:
             logging.debug("webhook_received: no file info found in update")
 
@@ -549,7 +130,7 @@ async def start_health_server(
 ) -> web.AppRunner:
     """Start HTTP health check server for Cloud Run."""
     app = web.Application()
-    app["bot_app"] = bot_app  # Store reference to initialized bot
+    app["bot_app"] = bot_app
     app["pubsub_publisher"] = pubsub_publisher
     app["pubsub_topic_path"] = pubsub_topic_path
     app.router.add_get("/", handle_root)
@@ -561,24 +142,21 @@ async def start_health_server(
     site = web.TCPSite(runner, host, port)
     await site.start()
 
-    logging.info(f"Health server listening on {host}:{port}")
+    logging.info("Health server listening on %s:%s", host, port)
     return runner
 
 
 async def _main() -> None:
     logging.basicConfig(level=logging.INFO)
 
-    # Load settings FIRST - fail fast if config is invalid
     logging.info("Loading configuration...")
     try:
         settings = load_settings()
         logging.info("Configuration loaded successfully")
     except ValueError as exc:
-        logging.error(f"Configuration error: {exc}")
-        logging.error("Bot cannot start due to missing or invalid environment variables")
+        logging.error("Configuration error: %s", exc)
         raise SystemExit(1) from exc
 
-    # Initialize Pub/Sub publisher
     pubsub_publisher = None
     pubsub_topic_path = None
     try:
@@ -589,22 +167,16 @@ async def _main() -> None:
         logging.exception("Failed to initialize Pub/Sub publisher: %s", exc)
         raise SystemExit(1) from exc
 
-    # Initialize bot
     app = ConversionBot(settings)
     logging.info("Bot initialized successfully")
 
-    # Initialize httpx client and other resources
-    await app.start()
-
-    # Cloud Run health server config - start AFTER bot is ready
     health_host = "0.0.0.0"
     health_port = int(os.getenv("PORT", "8080"))
 
-    # Setup graceful shutdown
     shutdown_event = asyncio.Event()
 
     def signal_handler(sig: int, frame: object) -> None:
-        logging.info(f"Received signal {sig}, initiating graceful shutdown")
+        logging.info("Received signal %s, initiating graceful shutdown", sig)
         shutdown_event.set()
 
     signal.signal(signal.SIGTERM, signal_handler)
@@ -616,7 +188,6 @@ async def _main() -> None:
             health_host, health_port, app, pubsub_publisher, pubsub_topic_path
         )
 
-        # Only setup webhook if ENABLE_WEBHOOK_SETUP is true
         if settings.enable_webhook_setup:
             url = os.getenv("BOT_URL", "").rstrip("/")
             if not url:
@@ -629,25 +200,21 @@ async def _main() -> None:
                         secret_token=settings.tg_webhook_secret,
                     )
                     logging.info("Telegram webhook configured: %s", webhook_url)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logging.exception("Failed to configure Telegram webhook: %s", webhook_url)
         else:
             logging.info("ENABLE_WEBHOOK_SETUP=false, skipping webhook setup")
 
-        # Wait for shutdown signal
         await shutdown_event.wait()
         logging.info("Shutdown signal received, stopping services")
     except Exception as exc:
-        logging.error(f"Error in main loop: {exc}", exc_info=True)
+        logging.error("Error in main loop: %s", exc, exc_info=True)
     finally:
         if health_runner is not None:
             await health_runner.cleanup()
 
-        # Cleanup resources in proper order
-        await app.stop()  # Close httpx client
-        await app.bot.session.close()  # Close bot session last
+        await app.bot.session.close()
 
-        # Cleanup Pub/Sub publisher
         if pubsub_publisher:
             pubsub_publisher.stop()
 

@@ -2,7 +2,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from config import Settings, _parse_allowed, _required, load_settings, normalize_converter_url
+from config import Settings, _parse_allowed, _required, load_settings
 
 
 class ConfigTests(unittest.TestCase):
@@ -17,99 +17,78 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(_required("TEST_VAR"), "test_value")
 
     def test_parse_allowed_single(self) -> None:
-        result = _parse_allowed("123")
-        self.assertEqual(result, {123})
+        self.assertEqual(_parse_allowed("123"), {123})
 
     def test_parse_allowed_multiple(self) -> None:
-        result = _parse_allowed("111,222,333")
-        self.assertEqual(result, {111, 222, 333})
+        self.assertEqual(_parse_allowed("111,222,333"), {111, 222, 333})
 
     def test_parse_allowed_with_spaces(self) -> None:
-        result = _parse_allowed("111, 222 , 333")
-        self.assertEqual(result, {111, 222, 333})
+        self.assertEqual(_parse_allowed("111, 222 , 333"), {111, 222, 333})
 
     def test_parse_allowed_empty_items(self) -> None:
-        result = _parse_allowed("111,,333")
-        self.assertEqual(result, {111, 333})
+        self.assertEqual(_parse_allowed("111,,333"), {111, 333})
 
     def test_parse_allowed_pipe_separator(self) -> None:
-        result = _parse_allowed("111|222|333")
-        self.assertEqual(result, {111, 222, 333})
+        self.assertEqual(_parse_allowed("111|222|333"), {111, 222, 333})
 
     def test_parse_allowed_pipe_with_spaces(self) -> None:
-        result = _parse_allowed("111 | 222 | 333")
-        self.assertEqual(result, {111, 222, 333})
+        self.assertEqual(_parse_allowed("111 | 222 | 333"), {111, 222, 333})
 
     def test_parse_allowed_mixed_separators(self) -> None:
-        result = _parse_allowed("111|222, 333 444")
-        self.assertEqual(result, {111, 222, 333, 444})
+        self.assertEqual(_parse_allowed("111|222, 333 444"), {111, 222, 333, 444})
 
     def test_parse_allowed_trailing_separator(self) -> None:
-        result = _parse_allowed("111|222|")
-        self.assertEqual(result, {111, 222})
+        self.assertEqual(_parse_allowed("111|222|"), {111, 222})
 
     def test_load_settings_with_defaults(self) -> None:
         env = {
             "BOT_TOKEN": "test_token",
+            "TG_WEBHOOK_SECRET": "webhook-secret",
             "ALLOWED_EDITORS": "111,222",
             "CHAT_ID": "-100123",
             "TOPIC_SOURCE_ID": "10",
-            "TOPIC_CONVERTED_ID": "20",
-            "CONVERTER_URL": "https://example.com/",
-            "CONVERTER_API_KEY": "secret",
-            "BOT_URL": "https://bot.example.com/",
-            "TG_WEBHOOK_SECRET": "webhook-secret",
+            "GCP_PROJECT": "my-project",
+            "PUBSUB_TOPIC": "my-topic",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = load_settings()
             self.assertEqual(settings.bot_token, "test_token")
+            self.assertEqual(settings.tg_webhook_secret, "webhook-secret")
             self.assertEqual(settings.allowed_editors, {111, 222})
             self.assertEqual(settings.chat_id, -100123)
             self.assertEqual(settings.topic_source_id, 10)
-            self.assertEqual(settings.topic_converted_id, 20)
-            self.assertEqual(settings.converter_url, "https://example.com/convert")
-            self.assertEqual(settings.converter_api_key, "secret")
-            self.assertEqual(settings.bot_url, "https://bot.example.com")
-            self.assertEqual(settings.tg_webhook_secret, "webhook-secret")
-            self.assertEqual(settings.max_file_mb, 40)
-            self.assertEqual(settings.batch_window_seconds, 120)
-            self.assertEqual(settings.progress_update_every, 3)
+            self.assertEqual(settings.gcp_project, "my-project")
+            self.assertEqual(settings.pubsub_topic, "my-topic")
+            self.assertFalse(settings.enable_webhook_setup)
 
-    def test_load_settings_custom_values(self) -> None:
+    def test_load_settings_enable_webhook_setup(self) -> None:
         env = {
             "BOT_TOKEN": "token",
+            "TG_WEBHOOK_SECRET": "secret",
             "ALLOWED_EDITORS": "999",
             "CHAT_ID": "-100999",
             "TOPIC_SOURCE_ID": "1",
-            "TOPIC_CONVERTED_ID": "2",
-            "CONVERTER_URL": "http://localhost:8080",
-            "CONVERTER_API_KEY": "key",
-            "BOT_URL": "https://bot.example.com",
-            "TG_WEBHOOK_SECRET": "secret",
-            "MAX_FILE_MB": "50",
-            "BATCH_WINDOW_SECONDS": "60",
-            "PROGRESS_UPDATE_EVERY": "5",
+            "GCP_PROJECT": "proj",
+            "PUBSUB_TOPIC": "topic",
+            "ENABLE_WEBHOOK_SETUP": "true",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = load_settings()
-            self.assertEqual(settings.max_file_mb, 50)
-            self.assertEqual(settings.batch_window_seconds, 60)
-            self.assertEqual(settings.progress_update_every, 5)
+            self.assertTrue(settings.enable_webhook_setup)
 
-    def test_normalize_converter_url_adds_convert(self) -> None:
-        self.assertEqual(normalize_converter_url("https://example.com"), "https://example.com/convert")
-
-    def test_normalize_converter_url_keeps_convert_suffix(self) -> None:
-        self.assertEqual(
-            normalize_converter_url("https://example.com/convert"),
-            "https://example.com/convert",
-        )
-
-    def test_normalize_converter_url_trims_and_deduplicates_convert(self) -> None:
-        self.assertEqual(
-            normalize_converter_url("  https://example.com/convert/convert/  "),
-            "https://example.com/convert",
-        )
+    def test_load_settings_empty_allowed_editors_raises(self) -> None:
+        env = {
+            "BOT_TOKEN": "token",
+            "TG_WEBHOOK_SECRET": "secret",
+            "ALLOWED_EDITORS": "   ",
+            "CHAT_ID": "-100",
+            "TOPIC_SOURCE_ID": "1",
+            "GCP_PROJECT": "proj",
+            "PUBSUB_TOPIC": "topic",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ValueError):
+                load_settings()
 
 
 if __name__ == "__main__":
