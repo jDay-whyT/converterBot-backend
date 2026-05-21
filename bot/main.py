@@ -105,7 +105,15 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
                     }
 
                     message_bytes = json.dumps(job_data).encode("utf-8")
-                    publisher.publish(topic_path, message_bytes)
+                    future = publisher.publish(topic_path, message_bytes)
+                    try:
+                        await asyncio.to_thread(future.result, timeout=10)
+                    except Exception as pub_exc:
+                        logging.error(
+                            "pubsub_publish_failed file_id=%s error=%s",
+                            file_id, pub_exc,
+                        )
+                        return web.Response(status=500, text="publish failed")
                     logging.info(
                         "pubsub_published file_id=%s file_unique_id=%s chat_id=%s message_id=%s",
                         file_id, file_unique_id, chat_id, message_id,
