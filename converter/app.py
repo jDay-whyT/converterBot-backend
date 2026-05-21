@@ -1,9 +1,11 @@
 import asyncio
+import logging
 import os
 import shutil
 import subprocess
 import tempfile
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
@@ -95,7 +97,13 @@ MIN_INPUT_BYTES = int(os.getenv("MIN_INPUT_BYTES", str(100 * 1024)))
 MIN_BLACK_BAND_LUMA = float(os.getenv("MIN_BLACK_BAND_LUMA", "0.002"))
 MIN_SCENE_LUMA_FOR_BAND_CHECK = float(os.getenv("MIN_SCENE_LUMA_FOR_BAND_CHECK", "0.03"))
 
-app = FastAPI(title="converter-service")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await _check_tools()
+    yield
+
+
+app = FastAPI(title="converter-service", lifespan=lifespan)
 
 
 @dataclass
@@ -247,11 +255,9 @@ def _black_band_detected(path: Path) -> bool:
     mean_edges = (left, right, top, bottom)
     black_band = full >= MIN_SCENE_LUMA_FOR_BAND_CHECK and min(mean_edges) < MIN_BLACK_BAND_LUMA
     mean_str = lambda val: f"{val:.6f}" if val >= 0 else "na"
-    print(
-        "img_check "
-        f"mean_full={mean_str(full)} mean_l={mean_str(left)} mean_r={mean_str(right)} "
-        f"mean_t={mean_str(top)} mean_b={mean_str(bottom)} black_band={int(black_band)}",
-        flush=True,
+    logging.info(
+        "img_check mean_full=%s mean_l=%s mean_r=%s mean_t=%s mean_b=%s black_band=%d",
+        mean_str(full), mean_str(left), mean_str(right), mean_str(top), mean_str(bottom), int(black_band),
     )
     return black_band
 
@@ -350,7 +356,7 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
     def _record_fail(tool: str, reason: str, returncode: Optional[int] = None, timeout: bool = False) -> None:
         stderr = _truncate_stderr(reason)
         rc = "na" if returncode is None else str(returncode)
-        print(f"raw_step={tool} status=fail reason={stderr} timeout={int(timeout)} rc={rc}", flush=True)
+        logging.warning("raw_step=%s status=fail reason=%s timeout=%d rc=%s", tool, stderr, int(timeout), rc)
         errors.append(CommandError(tool=tool, returncode=returncode, stderr=stderr, timeout=timeout))
 
     # A) exiftool embedded preview -> magick -> jpg
@@ -372,17 +378,14 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
                 stderr = _truncate_stderr(proc.stderr.decode("utf-8", errors="ignore") or "")
                 if proc.returncode != 0:
                     if "doesn't exist" in stderr.lower() or "not found" in stderr.lower():
-                        print(
-                            f"raw_step=exiftool:{preview_tag} status=skip reason=tag_missing_or_empty rc={proc.returncode}",
-                            flush=True,
-                        )
+                        logging.info("raw_step=exiftool:%s status=skip reason=tag_missing_or_empty rc=%s", preview_tag, proc.returncode)
                         preview_path.unlink(missing_ok=True)
                         continue
                     raise CommandExecutionError("exiftool", proc.returncode, stderr or "preview extraction failed")
                 try:
                     _validate_output_file(preview_path)
                 except RuntimeError:
-                    print(f"raw_step=exiftool:{preview_tag} status=skip reason=tag_missing_or_empty rc=0", flush=True)
+                    logging.info("raw_step=exiftool:%s status=skip reason=tag_missing_or_empty rc=0", preview_tag)
                     preview_path.unlink(missing_ok=True)
                     continue
                 fail_reason = _image_fail_reason(preview_path)
@@ -396,7 +399,7 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
                 if fail_reason:
                     _record_fail(f"exiftool:{preview_tag}", fail_reason)
                     continue
-                print(f"raw_step=exiftool:{preview_tag} status=ok reason=preview_extracted", flush=True)
+                logging.info("raw_step=exiftool:%s status=ok reason=preview_extracted", preview_tag)
                 return
             except CommandExecutionError as exc:
                 _record_fail(f"exiftool:{preview_tag}", exc.stderr, returncode=exc.returncode, timeout=exc.timeout)
@@ -434,7 +437,7 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
             fail_reason = _image_fail_reason(output_path)
             if fail_reason:
                 raise RuntimeError(fail_reason)
-            print("raw_step=darktable-cli status=ok reason=render_success", flush=True)
+            logging.info("raw_step=darktable-cli status=ok reason=render_success")
             return
         except CommandExecutionError as exc:
             _record_fail("darktable-cli", exc.stderr, returncode=exc.returncode, timeout=exc.timeout)
@@ -470,7 +473,7 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
             fail_reason = _image_fail_reason(output_path)
             if fail_reason:
                 raise RuntimeError(fail_reason)
-            print("raw_step=rawtherapee-cli status=ok reason=decode_success", flush=True)
+            logging.info("raw_step=rawtherapee-cli status=ok reason=decode_success")
             return
         except CommandExecutionError as exc:
             _record_fail("rawtherapee-cli", exc.stderr, returncode=exc.returncode, timeout=exc.timeout)
@@ -495,7 +498,7 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
             fail_reason = _image_fail_reason(output_path)
             if fail_reason:
                 raise RuntimeError(fail_reason)
-            print("raw_step=dcraw_emu status=ok reason=decode_success", flush=True)
+            logging.info("raw_step=dcraw_emu status=ok reason=decode_success")
             return
         except CommandExecutionError as exc:
             _record_fail("dcraw_emu", exc.stderr, returncode=exc.returncode, timeout=exc.timeout)
@@ -520,7 +523,7 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
             fail_reason = _image_fail_reason(output_path)
             if fail_reason:
                 raise RuntimeError(fail_reason)
-            print("raw_step=dcraw status=ok reason=decode_success", flush=True)
+            logging.info("raw_step=dcraw status=ok reason=decode_success")
             return
         except CommandExecutionError as exc:
             _record_fail("dcraw", exc.stderr, returncode=exc.returncode, timeout=exc.timeout)
@@ -546,7 +549,7 @@ def _convert_heif_with_fallback(input_path: Path, output_path: Path, quality: in
                 raise RuntimeError("image check failed for output jpeg")
             return
         except (CommandExecutionError, RuntimeError) as exc:
-            print(f"heif_step=heif-convert status=fail reason={exc} falling_back_to_magick", flush=True)
+            logging.warning("heif_step=heif-convert status=fail reason=%s falling_back_to_magick", exc)
 
     # Fallback: ImageMagick direct decode (works when libheif is installed)
     _magick_to_jpeg(input_path, output_path, quality, max_side)
@@ -580,10 +583,9 @@ def _success_response(
     start: float,
 ) -> FileResponse:
     elapsed_ms = round((time.monotonic() - start) * 1000, 2)
-    print(
-        f"status=ok ext={suffix} in_bytes={size_bytes} out_bytes={out_path.stat().st_size} quality={quality} "
-        f"max_side={max_side} elapsed_ms={elapsed_ms}",
-        flush=True,
+    logging.info(
+        "status=ok ext=%s in_bytes=%d out_bytes=%d quality=%d max_side=%s elapsed_ms=%s",
+        suffix, size_bytes, out_path.stat().st_size, quality, max_side, elapsed_ms,
     )
     return FileResponse(
         path=out_path,
@@ -646,14 +648,13 @@ async def convert(
             renamed_path = tmpdir / f"input{mapped_ext}"
             in_path = in_path.rename(renamed_path)
 
-        print(
-            f"input_saved path={in_path} orig={file.filename} size={input_size} filetype={file_type} mimetype={mime_type}",
-            flush=True,
+        logging.info(
+            "input_saved path=%s orig=%s size=%d filetype=%s mimetype=%s",
+            in_path, file.filename, input_size, file_type, mime_type,
         )
-
-        print(
-            f"detect_filetype ext={suffix or 'none'} file_type={file_type} mime_type={mime_type} route={route}",
-            flush=True,
+        logging.info(
+            "detect_filetype ext=%s file_type=%s mime_type=%s route=%s",
+            suffix or "none", file_type, mime_type, route,
         )
 
         if route == "raw":
@@ -662,7 +663,7 @@ async def convert(
                     status_code=422,
                     detail=f"RAW input too small: {input_size} bytes (min {MIN_INPUT_BYTES})",
                 )
-            print(f"raw_input path={in_path} input_size={input_size}", flush=True)
+            logging.info("raw_input path=%s input_size=%d", in_path, input_size)
             await _convert_raw_or_422(in_path, out_path, quality, max_side)
             return _success_response(out_path, tmpdir, suffix, size_bytes, quality, max_side, start)
         else:
@@ -683,7 +684,6 @@ async def convert(
     return _success_response(out_path, tmpdir, suffix, size_bytes, quality, max_side, start)
 
 
-@app.on_event("startup")
 async def _check_tools() -> None:
     missing = [tool for tool in ("magick",) if shutil.which(tool) is None]
     if shutil.which("exiftool") is None:
@@ -707,4 +707,4 @@ async def _check_tools() -> None:
         pass
 
     if missing:
-        print(f"warning=missing_tools tools={','.join(missing)}", flush=True)
+        logging.warning("missing_tools tools=%s", ",".join(missing))
