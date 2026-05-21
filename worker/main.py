@@ -6,25 +6,59 @@ import json
 import logging
 import os
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from time import perf_counter
 
 import httpx
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from aiogram.types import BufferedInputFile
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from config import Settings, load_settings
 
-app = FastAPI(title="worker-service")
-
 # Global state
 _settings: Settings | None = None
 _bot: Bot | None = None
 _http_client: httpx.AsyncClient | None = None
 _processed_jobs: dict[str, None] = {}  # insertion-ordered for correct FIFO eviction
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _settings, _bot, _http_client
+    logging.basicConfig(level=logging.INFO)
+    logging.info("Worker service starting up...")
+
+    try:
+        _settings = load_settings()
+        logging.info("Configuration loaded successfully")
+    except ValueError as exc:
+        logging.error("Configuration error: %s", exc)
+        raise
+
+    _bot = Bot(token=_settings.bot_token)
+    _http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(_settings.conversion_timeout_seconds),
+        limits=httpx.Limits(
+            max_connections=5,
+            max_keepalive_connections=2,
+        ),
+    )
+    logging.info("Worker service initialized successfully")
+
+    yield
+
+    if _http_client:
+        await _http_client.aclose()
+    if _bot:
+        await _bot.session.close()
+    logging.info("Worker service shutdown complete")
+
+
+app = FastAPI(title="worker-service", lifespan=lifespan)
 
 
 def _is_file_too_big_error(exc: TelegramBadRequest) -> bool:
@@ -44,6 +78,15 @@ async def _tg_retry(fn, *args, max_retries: int = 3, **kwargs):
                 fn.__name__, attempt + 1, max_retries, sleep_time,
             )
             await asyncio.sleep(sleep_time)
+        except TelegramNetworkError as exc:
+            if attempt == max_retries:
+                raise
+            sleep_time = 2 ** attempt
+            logging.warning(
+                "TelegramNetworkError fn=%s attempt=%s/%s sleeping=%ss error=%s",
+                fn.__name__, attempt + 1, max_retries, sleep_time, exc,
+            )
+            await asyncio.sleep(sleep_time)
 
 
 def format_ms(seconds: float | None) -> int | None:
@@ -51,39 +94,6 @@ def format_ms(seconds: float | None) -> int | None:
         return None
     return int(seconds * 1000)
 
-
-@app.on_event("startup")
-async def startup() -> None:
-    global _settings, _bot, _http_client
-    logging.basicConfig(level=logging.INFO)
-    logging.info("Worker service starting up...")
-
-    try:
-        _settings = load_settings()
-        logging.info("Configuration loaded successfully")
-    except ValueError as exc:
-        logging.error(f"Configuration error: {exc}")
-        raise
-
-    _bot = Bot(token=_settings.bot_token)
-    _http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(_settings.conversion_timeout_seconds),
-        limits=httpx.Limits(
-            max_connections=5,
-            max_keepalive_connections=2,
-        ),
-    )
-    logging.info("Worker service initialized successfully")
-
-
-@app.on_event("shutdown")
-async def shutdown() -> None:
-    global _bot, _http_client
-    if _http_client:
-        await _http_client.aclose()
-    if _bot:
-        await _bot.session.close()
-    logging.info("Worker service shutdown complete")
 
 
 @app.get("/health")
@@ -136,7 +146,9 @@ async def pubsub_push(request: Request) -> JSONResponse:
         logging.info("Job already processed: %s", idempotency_key)
         return JSONResponse({"status": "duplicate", "key": idempotency_key}, status_code=200)
 
-    # Process the job
+    # Claim before processing to prevent concurrent duplicate execution
+    _processed_jobs[idempotency_key] = None
+
     try:
         await process_conversion_job(
             file_id=file_id,
@@ -146,9 +158,6 @@ async def pubsub_push(request: Request) -> JSONResponse:
             bot=_bot,
             http_client=_http_client,
         )
-
-        # Mark as processed
-        _processed_jobs[idempotency_key] = None
 
         # Evict oldest 5000 entries when limit reached
         if len(_processed_jobs) > 10000:
@@ -161,7 +170,6 @@ async def pubsub_push(request: Request) -> JSONResponse:
     except TelegramBadRequest as exc:
         if _is_file_too_big_error(exc):
             logging.warning("ACK job due to Telegram size limit: %s", exc)
-            _processed_jobs[idempotency_key] = None
             try:
                 await _tg_retry(_bot.send_message, chat_id=chat_id, message_thread_id=_settings.topic_converted_id, text="Файл слишком большой, лимит 20MB у Bot API")
             except Exception as notify_exc:  # noqa: BLE001
@@ -170,9 +178,11 @@ async def pubsub_push(request: Request) -> JSONResponse:
                 {"status": "skipped", "reason": "telegram_file_too_big", "key": idempotency_key},
                 status_code=200,
             )
+        del _processed_jobs[idempotency_key]
         logging.exception("Job processing failed with TelegramBadRequest: %s", exc)
         raise HTTPException(status_code=500, detail=f"Processing failed: {exc}") from exc
     except Exception as exc:
+        del _processed_jobs[idempotency_key]
         logging.exception("Job processing failed: %s", exc)
         # Return 5xx to trigger Pub/Sub retry
         raise HTTPException(status_code=500, detail=f"Processing failed: {exc}") from exc

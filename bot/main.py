@@ -47,7 +47,10 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
     if not expected or got != expected:
         return web.Response(status=401, text="unauthorized")
 
-    update_payload = await request.json()
+    try:
+        update_payload = await request.json()
+    except Exception:
+        return web.Response(status=400, text="invalid json")
 
     if "update_id" not in update_payload:
         logging.info("webhook_received: no update_id in payload, ignoring")
