@@ -1,3 +1,4 @@
+import json
 import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -100,6 +101,31 @@ class WebhookAllowedEditorsTests(unittest.IsolatedAsyncioTestCase):
             response = await handle_telegram_webhook(request)
         self.assertEqual(response.status, 200)
         publisher.publish.assert_not_called()
+
+
+    async def test_photo_message_publishes_largest(self) -> None:
+        publisher = MagicMock()
+        update = {
+            "update_id": 2,
+            "message": {
+                "chat": {"id": -100},
+                "message_id": 2,
+                "message_thread_id": 10,
+                "from": {"id": 111},
+                "photo": [
+                    {"file_id": "small_id", "file_unique_id": "usmall"},
+                    {"file_id": "large_id", "file_unique_id": "ularge"},
+                ],
+            },
+        }
+        request = _make_request(update, _make_settings([111]), publisher)
+        with patch.dict(os.environ, {"TG_WEBHOOK_SECRET": "secret"}):
+            response = await handle_telegram_webhook(request)
+        self.assertEqual(response.status, 200)
+        publisher.publish.assert_called_once()
+        job = json.loads(publisher.publish.call_args[0][1].decode())
+        self.assertEqual(job["file_id"], "large_id")
+        self.assertEqual(job["file_unique_id"], "ularge")
 
 
 if __name__ == "__main__":

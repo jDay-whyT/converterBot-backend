@@ -570,6 +570,29 @@ async def _convert_raw_or_422(
         raise HTTPException(status_code=422, detail=_truncate_stderr(str(exc))) from exc
 
 
+def _success_response(
+    out_path: Path,
+    tmpdir: Path,
+    suffix: str,
+    size_bytes: int,
+    quality: int,
+    max_side: Optional[int],
+    start: float,
+) -> FileResponse:
+    elapsed_ms = round((time.monotonic() - start) * 1000, 2)
+    print(
+        f"status=ok ext={suffix} in_bytes={size_bytes} out_bytes={out_path.stat().st_size} quality={quality} "
+        f"max_side={max_side} elapsed_ms={elapsed_ms}",
+        flush=True,
+    )
+    return FileResponse(
+        path=out_path,
+        media_type="image/jpeg",
+        filename="output.jpg",
+        background=BackgroundTask(lambda: shutil.rmtree(tmpdir, ignore_errors=True)),
+    )
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -641,18 +664,7 @@ async def convert(
                 )
             print(f"raw_input path={in_path} input_size={input_size}", flush=True)
             await _convert_raw_or_422(in_path, out_path, quality, max_side)
-            elapsed_ms = round((time.monotonic() - start) * 1000, 2)
-            print(
-                f"status=ok ext={suffix} in_bytes={size_bytes} out_bytes={out_path.stat().st_size} quality={quality} "
-                f"max_side={max_side} elapsed_ms={elapsed_ms}",
-                flush=True,
-            )
-            return FileResponse(
-                path=out_path,
-                media_type="image/jpeg",
-                filename="output.jpg",
-                background=BackgroundTask(lambda: shutil.rmtree(tmpdir, ignore_errors=True)),
-            )
+            return _success_response(out_path, tmpdir, suffix, size_bytes, quality, max_side, start)
         else:
             try:
                 if route == "heif":
@@ -668,19 +680,7 @@ async def convert(
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise
 
-    elapsed_ms = round((time.monotonic() - start) * 1000, 2)
-    print(
-        f"status=ok ext={suffix} in_bytes={size_bytes} out_bytes={out_path.stat().st_size} quality={quality} "
-        f"max_side={max_side} elapsed_ms={elapsed_ms}",
-        flush=True,
-    )
-
-    return FileResponse(
-        path=out_path,
-        media_type="image/jpeg",
-        filename="output.jpg",
-        background=BackgroundTask(lambda: shutil.rmtree(tmpdir, ignore_errors=True)),
-    )
+    return _success_response(out_path, tmpdir, suffix, size_bytes, quality, max_side, start)
 
 
 @app.on_event("startup")
