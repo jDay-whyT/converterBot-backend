@@ -178,7 +178,7 @@ jobs:
             CONVERSION_TIMEOUT_SECONDS=600
           flags: >-
             --min-instances=0
-            --max-instances=2
+            --max-instances=5
             --cpu=1
             --memory=1Gi
             --concurrency=1
