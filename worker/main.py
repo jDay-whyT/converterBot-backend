@@ -181,6 +181,25 @@ async def pubsub_push(request: Request) -> JSONResponse:
         del _processed_jobs[idempotency_key]
         logging.exception("Job processing failed with TelegramBadRequest: %s", exc)
         raise HTTPException(status_code=500, detail=f"Processing failed: {exc}") from exc
+    except httpx.HTTPStatusError as exc:
+        if 400 <= exc.response.status_code < 500:
+            logging.warning("ACK job due to converter client error: %s", exc)
+            try:
+                await _tg_retry(
+                    _bot.send_message,
+                    chat_id=chat_id,
+                    message_thread_id=_settings.topic_converted_id,
+                    text="Не удалось сконвертировать файл: формат не поддерживается",
+                )
+            except Exception as notify_exc:  # noqa: BLE001
+                logging.warning("Failed to notify chat about unsupported format: %s", notify_exc)
+            return JSONResponse(
+                {"status": "skipped", "reason": "converter_client_error", "key": idempotency_key},
+                status_code=200,
+            )
+        del _processed_jobs[idempotency_key]
+        logging.exception("Job processing failed with converter server error: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Processing failed: {exc}") from exc
     except Exception as exc:
         del _processed_jobs[idempotency_key]
         logging.exception("Job processing failed: %s", exc)

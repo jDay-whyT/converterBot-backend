@@ -197,7 +197,7 @@ jobs:
             MAX_FILE_MB=${{ vars.MAX_FILE_MB || '40' }}
           flags: >-
             --min-instances=0
-            --max-instances=3
+            --max-instances=5
             --cpu=2
             --memory=4Gi
             --concurrency=1
