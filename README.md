@@ -6,8 +6,20 @@
 
 ## Архитектура
 
-```
-Telegram → photo-convert-bot → Pub/Sub → photo-converter → Telegram (result)
+```mermaid
+flowchart LR
+    TG[Telegram]
+    Bot["photo-convert-bot<br/>aiohttp webhook"]
+    PS[["Pub/Sub<br/>tg-convert-jobs-push"]]
+    Conv["photo-converter<br/>FastAPI"]
+
+    TG -- "webhook update" --> Bot
+    Bot -- "publish job" --> PS
+    PS -- "POST /pubsub/push" --> Conv
+    Conv -- "get_file + download" --> TG
+    Conv -- "send_document (JPG)" --> TG
+
+    Manual["curl / manual test"] -. "POST /convert + X-API-KEY" .-> Conv
 ```
 
 1. **`photo-convert-bot`** — aiohttp webhook-сервер. Принимает Telegram-апдейты, проверяет пользователя (`ALLOWED_EDITORS`) и чат/топик, публикует задание в Pub/Sub.
