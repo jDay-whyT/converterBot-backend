@@ -6,7 +6,7 @@ set -euo pipefail
 # Required environment variables
 : "${GCP_PROJECT:?GCP_PROJECT must be set}"
 : "${GCP_REGION:?GCP_REGION must be set}"
-: "${WORKER_SERVICE_URL:?WORKER_SERVICE_URL must be set (e.g., https://worker-service-xxx.run.app)}"
+: "${CONVERTER_SERVICE_URL:?CONVERTER_SERVICE_URL must be set (e.g., https://photo-converter-xxx.run.app)}"
 
 TOPIC_NAME="${PUBSUB_TOPIC:-tg-convert-jobs}"
 SUBSCRIPTION_NAME="${PUBSUB_SUBSCRIPTION:-tg-convert-jobs-push}"
@@ -24,7 +24,7 @@ fi
 echo ""
 echo "=== Creating Push Subscription ==="
 
-PUSH_ENDPOINT="${WORKER_SERVICE_URL}/pubsub/push"
+PUSH_ENDPOINT="${CONVERTER_SERVICE_URL}/pubsub/push"
 
 # Check if subscription exists
 if gcloud pubsub subscriptions describe "$SUBSCRIPTION_NAME" --project="$GCP_PROJECT" &>/dev/null; then

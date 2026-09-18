@@ -30,6 +30,10 @@ jobs:
           GCP_REGION: ${{ secrets.GCP_REGION }}
           CLOUD_RUN_CONVERTER_SERVICE: ${{ secrets.CLOUD_RUN_CONVERTER_SERVICE }}
           CONVERTER_API_KEY: ${{ secrets.CONVERTER_API_KEY }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ vars.CHAT_ID }}
+          TOPIC_CONVERTED_ID: ${{ vars.TOPIC_CONVERTED_ID }}
         run: |
           set -euo pipefail
 
@@ -40,14 +44,21 @@ jobs:
             GCP_REGION
             CLOUD_RUN_CONVERTER_SERVICE
             CONVERTER_API_KEY
+            CHAT_ID
+            TOPIC_CONVERTED_ID
           )
 
           for key in "${required[@]}"; do
             if [[ -z "${!key:-}" ]]; then
-              echo "Missing required secret: $key" >&2
+              echo "Missing required secret or variable: $key" >&2
               exit 1
             fi
           done
+
+          if [[ -z "${BOT_TOKEN:-}" && -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+            echo "Missing required secret: BOT_TOKEN or TELEGRAM_BOT_TOKEN" >&2
+            exit 1
+          fi
 
       - name: Normalize and validate image/repo names
         id: names
@@ -195,14 +206,19 @@ jobs:
           env_vars: |
             CONVERTER_API_KEY=${{ secrets.CONVERTER_API_KEY }}
             MAX_FILE_MB=${{ vars.MAX_FILE_MB || '40' }}
+            BOT_TOKEN=${{ secrets.BOT_TOKEN != '' && secrets.BOT_TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
+            CHAT_ID=${{ vars.CHAT_ID }}
+            TOPIC_CONVERTED_ID=${{ vars.TOPIC_CONVERTED_ID }}
+            CONVERSION_QUALITY=${{ vars.CONVERSION_QUALITY || '92' }}
           flags: >-
             --min-instances=0
-            --max-instances=5
+            --max-instances=${{ vars.CONVERTER_MAX_INSTANCES || '20' }}
             --cpu=2
             --memory=4Gi
             --concurrency=1
             --timeout=600
             --cpu-throttling
+            --allow-unauthenticated
 
   deploy_bot:
     name: Deploy bot

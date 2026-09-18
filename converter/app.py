@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import json
 import logging
 import os
 import shutil
@@ -10,12 +12,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
+from aiogram.types import BufferedInputFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.background import BackgroundTask
 
 API_KEY = os.getenv("CONVERTER_API_KEY", "")
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "40"))
+
+# Pub/Sub job processing (merged in from the former standalone worker service,
+# to avoid shipping the RAW file bytes over the network twice: Telegram->worker->converter).
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHAT_ID = int(os.getenv("CHAT_ID", "0") or "0")
+TOPIC_CONVERTED_ID = int(os.getenv("TOPIC_CONVERTED_ID", "0") or "0")
+CONVERSION_QUALITY = int(os.getenv("CONVERSION_QUALITY", "92"))
 
 RAW_SUFFIXES = {
     ".dng",
@@ -80,6 +92,10 @@ FILETYPE_EXTENSION_MAP = {
 }
 
 SUBPROCESS_TIMEOUT_SECONDS = int(os.getenv("SUBPROCESS_TIMEOUT_SECONDS", "90"))
+# Extracting an embedded preview either returns in a couple seconds or the tag is
+# absent entirely; up to 3 tags are tried in sequence, so keep this well under
+# SUBPROCESS_TIMEOUT_SECONDS to leave headroom under the shared 600s request budget.
+EXIFTOOL_PREVIEW_TIMEOUT_SECONDS = int(os.getenv("EXIFTOOL_PREVIEW_TIMEOUT_SECONDS", "20"))
 MAGICK_TIMEOUT_SECONDS = int(os.getenv("MAGICK_TIMEOUT_SECONDS", "90"))
 DCRAW_TIMEOUT_SECONDS = int(os.getenv("DCRAW_TIMEOUT_SECONDS", "120"))
 DARKTABLE_TIMEOUT_SECONDS = int(os.getenv("DARKTABLE_TIMEOUT_SECONDS", "180"))
@@ -97,13 +113,86 @@ MIN_INPUT_BYTES = int(os.getenv("MIN_INPUT_BYTES", str(100 * 1024)))
 MIN_BLACK_BAND_LUMA = float(os.getenv("MIN_BLACK_BAND_LUMA", "0.002"))
 MIN_SCENE_LUMA_FOR_BAND_CHECK = float(os.getenv("MIN_SCENE_LUMA_FOR_BAND_CHECK", "0.03"))
 
+_bot: Bot | None = None
+_processed_jobs: dict[str, None] = {}  # insertion-ordered for correct FIFO eviction
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _bot
+    logging.basicConfig(level=logging.INFO)
     await _check_tools()
+
+    if BOT_TOKEN:
+        _bot = Bot(token=BOT_TOKEN)
+
+    missing_pubsub_config = [
+        name for name, value in (("BOT_TOKEN", BOT_TOKEN), ("CHAT_ID", CHAT_ID), ("TOPIC_CONVERTED_ID", TOPIC_CONVERTED_ID))
+        if not value
+    ]
+    if missing_pubsub_config:
+        # Not fatal: /convert must keep working even without these. But log loudly
+        # (not just on first request) so a dropped env var on a manual `gcloud run
+        # services update` shows up at deploy time, not as silent 503s later.
+        logging.error(
+            "pubsub_config_incomplete missing=%s -- /pubsub/push will reject all jobs with 503 until fixed",
+            ",".join(missing_pubsub_config),
+        )
+
     yield
+
+    if _bot:
+        await _bot.session.close()
 
 
 app = FastAPI(title="converter-service", lifespan=lifespan)
+
+
+def _is_file_too_big_error(exc: TelegramBadRequest) -> bool:
+    return "file is too big" in str(exc).lower()
+
+
+def _safe_filename(name: Optional[str], fallback: str) -> str:
+    """Collapse to a bare filename, discarding any directory/traversal segments.
+
+    file_name comes from the Pub/Sub job payload (attacker-reachable via the
+    unauthenticated /pubsub/push endpoint) and is used to build a filesystem
+    path, so it must never be joined in raw.
+    """
+    candidate = Path(name).name if name else ""
+    if not candidate or candidate in (".", ".."):
+        return fallback
+    return candidate
+
+
+async def _tg_retry(fn, *args, max_retries: int = 3, **kwargs):
+    for attempt in range(max_retries + 1):
+        try:
+            return await fn(*args, **kwargs)
+        except TelegramRetryAfter as exc:
+            if attempt == max_retries:
+                raise
+            sleep_time = exc.retry_after + 1
+            logging.warning(
+                "TelegramRetryAfter fn=%s attempt=%s/%s sleeping=%ss",
+                fn.__name__, attempt + 1, max_retries, sleep_time,
+            )
+            await asyncio.sleep(sleep_time)
+        except TelegramNetworkError as exc:
+            if attempt == max_retries:
+                raise
+            sleep_time = 2 ** attempt
+            logging.warning(
+                "TelegramNetworkError fn=%s attempt=%s/%s sleeping=%ss error=%s",
+                fn.__name__, attempt + 1, max_retries, sleep_time, exc,
+            )
+            await asyncio.sleep(sleep_time)
+
+
+def format_ms(seconds: float | None) -> int | None:
+    if seconds is None:
+        return None
+    return int(seconds * 1000)
 
 
 @dataclass
@@ -372,7 +461,7 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
                         stdout=preview_file,
                         stderr=subprocess.PIPE,
                         check=False,
-                        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+                        timeout=EXIFTOOL_PREVIEW_TIMEOUT_SECONDS,
                         env={**os.environ, **DEFAULT_SUBPROCESS_ENV},
                     )
                 stderr = _truncate_stderr(proc.stderr.decode("utf-8", errors="ignore") or "")
@@ -405,7 +494,7 @@ def _convert_raw(input_path: Path, output_path: Path, quality: int, max_side: Op
                 _record_fail(f"exiftool:{preview_tag}", exc.stderr, returncode=exc.returncode, timeout=exc.timeout)
                 preview_path.unlink(missing_ok=True)
             except subprocess.TimeoutExpired:
-                _record_fail(f"exiftool:{preview_tag}", f"timeout after {SUBPROCESS_TIMEOUT_SECONDS}s", timeout=True)
+                _record_fail(f"exiftool:{preview_tag}", f"timeout after {EXIFTOOL_PREVIEW_TIMEOUT_SECONDS}s", timeout=True)
                 preview_path.unlink(missing_ok=True)
             except Exception as exc:
                 _record_fail(f"exiftool:{preview_tag}", str(exc))
@@ -600,6 +689,63 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+async def _perform_conversion(
+    in_path: Path,
+    out_path: Path,
+    quality: int,
+    max_side: Optional[int],
+) -> Path:
+    """Detect the file type and convert in_path to a JPEG at out_path.
+
+    Shared by the /convert HTTP route and the Pub/Sub job handler so a file
+    only ever needs to be written to disk once, in one service.
+    """
+    input_size = in_path.stat().st_size
+
+    try:
+        file_type, mime_type = await asyncio.to_thread(_detect_filetype, in_path)
+        route = _decoder_route(file_type, mime_type)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=_truncate_stderr(str(exc))) from exc
+
+    mapped_ext = _mapped_extension(file_type, mime_type)
+    if mapped_ext and in_path.suffix.lower() != mapped_ext:
+        renamed_path = in_path.with_name(f"input{mapped_ext}")
+        in_path = in_path.rename(renamed_path)
+
+    logging.info(
+        "input_saved path=%s size=%d filetype=%s mimetype=%s",
+        in_path, input_size, file_type, mime_type,
+    )
+    logging.info(
+        "detect_filetype file_type=%s mime_type=%s route=%s",
+        file_type, mime_type, route,
+    )
+
+    if route == "raw":
+        if input_size < MIN_INPUT_BYTES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"RAW input too small: {input_size} bytes (min {MIN_INPUT_BYTES})",
+            )
+        logging.info("raw_input path=%s input_size=%d", in_path, input_size)
+        await _convert_raw_or_422(in_path, out_path, quality, max_side)
+        return out_path
+
+    try:
+        if route == "heif":
+            await asyncio.to_thread(_convert_heif_with_fallback, in_path, out_path, quality, max_side)
+        else:
+            await asyncio.to_thread(_magick_to_jpeg, in_path, out_path, quality, max_side)
+        _validate_output_file(out_path)
+        if not await asyncio.to_thread(_image_ok, out_path):
+            raise RuntimeError("image check failed for output jpeg")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=_truncate_stderr(f"conversion failed: {exc}")) from exc
+
+    return out_path
+
+
 @app.post("/convert")
 async def convert(
     file: UploadFile = File(...),
@@ -634,54 +780,187 @@ async def convert(
     try:
         with open(in_path, "wb") as tmp_in:
             tmp_in.write(content)
-
-        input_size = in_path.stat().st_size
-
-        try:
-            file_type, mime_type = await asyncio.to_thread(_detect_filetype, in_path)
-            route = _decoder_route(file_type, mime_type)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=_truncate_stderr(str(exc))) from exc
-
-        mapped_ext = _mapped_extension(file_type, mime_type)
-        if mapped_ext and in_path.suffix.lower() != mapped_ext:
-            renamed_path = tmpdir / f"input{mapped_ext}"
-            in_path = in_path.rename(renamed_path)
-
-        logging.info(
-            "input_saved path=%s orig=%s size=%d filetype=%s mimetype=%s",
-            in_path, file.filename, input_size, file_type, mime_type,
-        )
-        logging.info(
-            "detect_filetype ext=%s file_type=%s mime_type=%s route=%s",
-            suffix or "none", file_type, mime_type, route,
-        )
-
-        if route == "raw":
-            if input_size < MIN_INPUT_BYTES:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"RAW input too small: {input_size} bytes (min {MIN_INPUT_BYTES})",
-                )
-            logging.info("raw_input path=%s input_size=%d", in_path, input_size)
-            await _convert_raw_or_422(in_path, out_path, quality, max_side)
-            return _success_response(out_path, tmpdir, suffix, size_bytes, quality, max_side, start)
-        else:
-            try:
-                if route == "heif":
-                    await asyncio.to_thread(_convert_heif_with_fallback, in_path, out_path, quality, max_side)
-                else:
-                    await asyncio.to_thread(_magick_to_jpeg, in_path, out_path, quality, max_side)
-                _validate_output_file(out_path)
-                if not await asyncio.to_thread(_image_ok, out_path):
-                    raise RuntimeError("image check failed for output jpeg")
-            except RuntimeError as exc:
-                raise HTTPException(status_code=422, detail=_truncate_stderr(f"conversion failed: {exc}")) from exc
+        out_path = await _perform_conversion(in_path, out_path, quality, max_side)
     except Exception:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise
 
     return _success_response(out_path, tmpdir, suffix, size_bytes, quality, max_side, start)
+
+
+@app.post("/pubsub/push")
+async def pubsub_push(request: Request) -> JSONResponse:
+    """Handle Pub/Sub push messages: download from Telegram, convert, upload back.
+
+    Runs in-process (no HTTP hop to a separate converter service), so the raw
+    file bytes cross the network exactly once on the way in and once on the way out.
+    """
+    if _bot is None or not CHAT_ID or not TOPIC_CONVERTED_ID:
+        logging.error("Service not configured for Pub/Sub processing (BOT_TOKEN/CHAT_ID/TOPIC_CONVERTED_ID)")
+        raise HTTPException(status_code=503, detail="pubsub processing not configured")
+
+    try:
+        body = await request.json()
+    except Exception as exc:
+        logging.exception("Failed to parse request body: %s", exc)
+        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+
+    message = body.get("message", {})
+    data_b64 = message.get("data")
+
+    if not data_b64:
+        logging.warning("No data in Pub/Sub message")
+        return JSONResponse({"status": "ignored", "reason": "no_data"}, status_code=200)
+
+    try:
+        data_json = base64.b64decode(data_b64).decode("utf-8")
+        job = json.loads(data_json)
+    except Exception as exc:
+        logging.exception("Failed to decode job data: %s", exc)
+        raise HTTPException(status_code=400, detail="Invalid job data") from exc
+
+    file_id = job.get("file_id")
+    file_unique_id = job.get("file_unique_id")
+    chat_id = job.get("chat_id")
+    message_id = job.get("message_id")
+    file_name = _safe_filename(job.get("file_name"), fallback=file_id)
+
+    if not file_id or not chat_id or not message_id:
+        logging.warning("Missing required fields in job: %s", job)
+        return JSONResponse({"status": "ignored", "reason": "missing_fields"}, status_code=200)
+
+    idempotency_key = file_unique_id or f"{chat_id}:{message_id}"
+    if idempotency_key in _processed_jobs:
+        logging.info("Job already processed: %s", idempotency_key)
+        return JSONResponse({"status": "duplicate", "key": idempotency_key}, status_code=200)
+
+    # Claim before processing to prevent concurrent duplicate execution
+    _processed_jobs[idempotency_key] = None
+
+    try:
+        await process_conversion_job(file_id=file_id, file_name=file_name or file_id, chat_id=chat_id)
+
+        if len(_processed_jobs) > 10000:
+            for key in list(_processed_jobs)[:5000]:
+                del _processed_jobs[key]
+
+        logging.info("Job completed successfully: %s", idempotency_key)
+        return JSONResponse({"status": "success", "key": idempotency_key}, status_code=200)
+
+    except TelegramBadRequest as exc:
+        if _is_file_too_big_error(exc):
+            logging.warning("ACK job due to Telegram size limit: %s", exc)
+            try:
+                await _tg_retry(_bot.send_message, chat_id=chat_id, message_thread_id=TOPIC_CONVERTED_ID, text="Файл слишком большой, лимит 20MB у Bot API")
+            except Exception as notify_exc:  # noqa: BLE001
+                logging.warning("Failed to notify chat about 20MB limit: %s", notify_exc)
+            return JSONResponse(
+                {"status": "skipped", "reason": "telegram_file_too_big", "key": idempotency_key},
+                status_code=200,
+            )
+        del _processed_jobs[idempotency_key]
+        logging.exception("Job processing failed with TelegramBadRequest: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Processing failed: {exc}") from exc
+    except HTTPException as exc:
+        if 400 <= exc.status_code < 500:
+            logging.warning("ACK job due to conversion client error: %s", exc.detail)
+            try:
+                await _tg_retry(
+                    _bot.send_message,
+                    chat_id=chat_id,
+                    message_thread_id=TOPIC_CONVERTED_ID,
+                    text="Не удалось сконвертировать файл: формат не поддерживается",
+                )
+            except Exception as notify_exc:  # noqa: BLE001
+                logging.warning("Failed to notify chat about unsupported format: %s", notify_exc)
+            return JSONResponse(
+                {"status": "skipped", "reason": "conversion_client_error", "key": idempotency_key},
+                status_code=200,
+            )
+        del _processed_jobs[idempotency_key]
+        logging.exception("Job processing failed with conversion server error: %s", exc.detail)
+        raise HTTPException(status_code=500, detail=f"Processing failed: {exc.detail}") from exc
+    except Exception as exc:
+        del _processed_jobs[idempotency_key]
+        logging.exception("Job processing failed: %s", exc)
+        # Return 5xx to trigger Pub/Sub retry
+        raise HTTPException(status_code=500, detail=f"Processing failed: {exc}") from exc
+
+
+async def process_conversion_job(file_id: str, file_name: str, chat_id: int) -> None:
+    """Download from Telegram, convert, and upload the result back."""
+    total_started = time.monotonic()
+    tg_download_s: float | None = None
+    convert_s: float | None = None
+    tg_upload_s: float | None = None
+    in_bytes = 0
+    out_bytes = 0
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="job-") as tmpdir:
+            source = Path(tmpdir) / file_name
+            out_path = Path(tmpdir) / "output.jpg"
+
+            download_started = time.monotonic()
+            file_info = await _tg_retry(_bot.get_file, file_id)
+            await _tg_retry(_bot.download_file, file_info.file_path, destination=source)
+            tg_download_s = time.monotonic() - download_started
+            in_bytes = source.stat().st_size
+
+            logging.info(
+                "tg_download file=%s file_id=%s size=%s download_ms=%s",
+                file_name, file_id, in_bytes, format_ms(tg_download_s)
+            )
+
+            convert_started = time.monotonic()
+            out_path = await _perform_conversion(source, out_path, CONVERSION_QUALITY, None)
+            convert_s = time.monotonic() - convert_started
+            jpg_bytes = await asyncio.to_thread(out_path.read_bytes)
+            out_bytes = len(jpg_bytes)
+
+            logging.info(
+                "conversion_done file=%s in_bytes=%s out_bytes=%s convert_ms=%s",
+                file_name, in_bytes, out_bytes, format_ms(convert_s)
+            )
+
+            target_name = f"{Path(file_name).stem}.jpg"
+            upload_started = time.monotonic()
+
+            await _tg_retry(
+                _bot.send_document,
+                chat_id=CHAT_ID,
+                message_thread_id=TOPIC_CONVERTED_ID,
+                document=BufferedInputFile(jpg_bytes, filename=target_name),
+            )
+            tg_upload_s = time.monotonic() - upload_started
+
+            total_s = time.monotonic() - total_started
+
+            logging.info(
+                "job_success file=%s file_id=%s chat_id=%s tg_download_ms=%s "
+                "convert_ms=%s tg_upload_ms=%s total_ms=%s in_bytes=%s out_bytes=%s",
+                file_name, file_id, chat_id,
+                format_ms(tg_download_s),
+                format_ms(convert_s),
+                format_ms(tg_upload_s),
+                format_ms(total_s),
+                in_bytes,
+                out_bytes,
+            )
+
+    except Exception as exc:
+        total_s = time.monotonic() - total_started
+        logging.error(
+            "job_failed file=%s file_id=%s chat_id=%s tg_download_ms=%s "
+            "convert_ms=%s tg_upload_ms=%s total_ms=%s error=%s",
+            file_name, file_id, chat_id,
+            format_ms(tg_download_s),
+            format_ms(convert_s),
+            format_ms(tg_upload_s),
+            format_ms(total_s),
+            str(exc),
+        )
+        raise
 
 
 async def _check_tools() -> None:

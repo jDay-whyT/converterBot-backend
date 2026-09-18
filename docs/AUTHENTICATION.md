@@ -1,32 +1,33 @@
 # Authentication Model
 
-This project now uses a single authentication mechanism for converter requests.
+Converter (`photo-converter`) has two entry points with two different auth mechanisms.
 
-## Current behavior
+## `/pubsub/push` — the real job path
 
-- Converter Cloud Run is public via IAM (`allUsers` has `roles/run.invoker`).
-- Bot calls `POST {CONVERTER_URL}/convert`.
-- Bot sends only one auth header: `X-API-KEY: <CONVERTER_API_KEY>`.
+- Bot publishes a job to the `tg-convert-jobs` Pub/Sub topic; it never calls converter directly.
+- Pub/Sub delivers it via a push subscription to `{CONVERTER_URL}/pubsub/push`.
+- Converter is deployed `--allow-unauthenticated` so the push subscription can reach it.
+- If you want to lock this down instead, create the subscription with
+  `--push-auth-service-account` (see `scripts/setup-pubsub.sh`) and switch the
+  service to `--no-allow-unauthenticated`, granting that service account
+  `roles/run.invoker` on converter.
+
+## `/convert` — manual/HTTP testing path
+
+- Guarded by a static header: `X-API-KEY: <CONVERTER_API_KEY>`.
 - No Cloud Run ID token is requested, cached, or attached.
 - No `Authorization: Bearer ...` header is used.
-
-## Deployment notes
-
-1. Keep the converter service publicly invokable:
-
-```bash
-gcloud run services add-iam-policy-binding "${CLOUD_RUN_CONVERTER_SERVICE}" \
-  --region="${REGION}" \
-  --member="allUsers" \
-  --role="roles/run.invoker"
-```
-
-2. Set the same `CONVERTER_API_KEY` in bot and converter environments.
-
-3. Verify converter access:
+- Verify access:
 
 ```bash
 curl -X POST "${CONVERTER_URL}/convert" \
   -H "X-API-KEY: ${CONVERTER_API_KEY}" \
   -F "file=@test-image.jpg"
 ```
+
+## Deployment notes
+
+Set `CONVERTER_API_KEY` in the converter's environment (used only for the
+`/convert` header check — `/pubsub/push` doesn't use it). `BOT_TOKEN`, `CHAT_ID`
+and `TOPIC_CONVERTED_ID` must also be set on converter now, since it downloads
+from and uploads to Telegram directly (see `docs/PUBSUB_ARCHITECTURE.md`).

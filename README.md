@@ -1,22 +1,23 @@
 # Converter Bot Backend
 
-Монорепозиторий с тремя Cloud Run сервисами для конвертации фото в JPEG через Telegram.
+Монорепозиторий с двумя Cloud Run сервисами для конвертации фото в JPEG через Telegram.
 
 ---
 
 ## Архитектура
 
 ```
-Telegram → photo-convert-bot → Pub/Sub → photo-convert-worker → photo-converter
-                                                    ↓
-                                              Telegram (result)
+Telegram → photo-convert-bot → Pub/Sub → photo-converter → Telegram (result)
 ```
 
 1. **`photo-convert-bot`** — aiohttp webhook-сервер. Принимает Telegram-апдейты, проверяет пользователя (`ALLOWED_EDITORS`) и чат/топик, публикует задание в Pub/Sub.
-2. **`photo-convert-worker`** — FastAPI + Pub/Sub push endpoint. Скачивает файл из Telegram, отправляет в converter, загружает JPG обратно в Telegram.
-3. **`photo-converter`** — FastAPI HTTP API `POST /convert`. Конвертирует изображения через ImageMagick / dcraw / darktable / heif-convert.
+2. **`photo-converter`** — FastAPI сервис с двумя входами:
+   - `POST /pubsub/push` — реальный путь заданий: скачивает файл из Telegram напрямую, конвертирует, загружает JPG обратно в Telegram.
+   - `POST /convert` — ручное HTTP API (multipart) для тестов, за `X-API-KEY`.
 
-### Поддерживаемые форматы (converter)
+   Раньше между bot и converter стоял отдельный `photo-convert-worker`, который скачивал файл и пересылал те же байты в converter по HTTP — RAW-файл (может быть 20-40MB) дважды проходил по сети до конвертации. Worker слили в converter, чтобы файл шёл по сети один раз в каждую сторону и не было двойного cold start на пачку.
+
+### Поддерживаемые форматы
 
 - **RAW:** DNG (включая Apple ProRAW), CR2, CR3, NEF, NRW, ARW, RAF, RW2, ORF, PEF, SRW, X3F, 3FR, IIQ, DCR, KDC, MRW
 - **HEIF/HEIC:** `.heic`, `.heif`
@@ -43,26 +44,18 @@ Telegram → photo-convert-bot → Pub/Sub → photo-convert-worker → photo-co
 | `BOT_URL` | — | Публичный URL бота (нужен если `ENABLE_WEBHOOK_SETUP=true`) |
 | `PORT` | — | HTTP порт (default: `8080`) |
 
-### `photo-convert-worker`
-
-| Переменная | Обязательная | Описание |
-|---|---|---|
-| `BOT_TOKEN` | ✓ | Telegram bot token |
-| `CHAT_ID` | ✓ | ID чата |
-| `TOPIC_CONVERTED_ID` | ✓ | ID топика для результатов (thread_id) |
-| `CONVERTER_URL` | ✓ | URL converter-сервиса |
-| `CONVERTER_API_KEY` | ✓ | API ключ для converter |
-| `MAX_FILE_MB` | — | Максимальный размер файла (default: `40`) |
-| `CONVERSION_TIMEOUT_SECONDS` | — | Таймаут запроса к converter (default: `600`) |
-| `CONVERSION_QUALITY` | — | JPEG quality 1–100 (default: `92`) |
-
 ### `photo-converter`
 
 | Переменная | Обязательная | Описание |
 |---|---|---|
-| `CONVERTER_API_KEY` | ✓ | API ключ (заголовок `X-API-KEY`) |
-| `MAX_FILE_MB` | — | Максимальный размер файла (default: `40`) |
+| `BOT_TOKEN` | ✓ | Telegram bot token (для скачивания/загрузки файлов в `/pubsub/push`) |
+| `CHAT_ID` | ✓ | ID чата, куда шлётся результат |
+| `TOPIC_CONVERTED_ID` | ✓ | ID топика для результатов (thread_id) |
+| `CONVERTER_API_KEY` | ✓ | API ключ для `/convert` (заголовок `X-API-KEY`) |
+| `MAX_FILE_MB` | — | Максимальный размер файла для `/convert` (default: `40`) |
+| `CONVERSION_QUALITY` | — | JPEG quality 1–100 для job-пайплайна (default: `92`) |
 | `SUBPROCESS_TIMEOUT_SECONDS` | — | Таймаут внешних процессов (default: `90`) |
+| `EXIFTOOL_PREVIEW_TIMEOUT_SECONDS` | — | Таймаут извлечения embedded-превью из RAW, до 3 попыток подряд (default: `20`) |
 | `MAGICK_TIMEOUT_SECONDS` | — | Таймаут ImageMagick (default: `90`) |
 | `DCRAW_TIMEOUT_SECONDS` | — | Таймаут dcraw/dcraw_emu (default: `120`) |
 | `DARKTABLE_TIMEOUT_SECONDS` | — | Таймаут darktable-cli (default: `180`) |
@@ -72,20 +65,22 @@ Telegram → photo-convert-bot → Pub/Sub → photo-convert-worker → photo-co
 ## Cloud Run конфигурация
 
 ### `photo-convert-bot`
-- `min-instances=1`, `startup-cpu-boost=true`, `cpu-throttling=false`
-- `cpu=2`, `memory=1Gi`
+- `min-instances=0`, `max-instances=10`, `cpu-throttling=true`
+- `cpu=1`, `memory=512Mi`, `concurrency=30`
 
-### `photo-convert-worker`
-- `min-instances=0`, **`max-instances=1`**, `startup-cpu-boost=true`
-- `cpu=1`, `memory=1Gi`
+### `photo-converter`
+- `min-instances=0` (осознанный выбор — сервис используется нечасто, но пачками по 500+ файлов; холодный старт дешевле, чем держать инстанс постоянно)
+- `max-instances` — управляется GitHub-переменной `CONVERTER_MAX_INSTANCES` (default `20`)
+- `cpu=2`, `memory=4Gi`, **`concurrency=1`** (RAW-декодирование — CPU-bound subprocess, конкурентность внутри инстанса не даст выигрыша)
+- `timeout=600`
 
-> `max-instances=1` обязателен — дедупликация заданий (`_processed_jobs`) in-memory и не расшаривается между инстансами.
+> Раз `concurrency=1` и работа CPU-bound, единственный рычаг пропускной способности — число инстансов (`max-instances`). Именно его надо поднимать при пачках в сотни файлов, а не concurrency.
+
+> Дедупликация заданий (`_processed_jobs`) — in-memory на инстанс, не расшарена между инстансами. При нескольких параллельных инстансах (что теперь норма при бурстах) повторная доставка от Pub/Sub может не распознаться как дубликат, если попадёт на другой инстанс. Для нечастого личного бота это приемлемый компромисс; если объём вырастет — нужно вынести в Firestore/Redis.
 
 ### Pub/Sub подписка (`tg-convert-jobs-push`)
-- `min-retry-delay=30s`, `max-retry-delay=300s`
 - `ackDeadlineSeconds=600`
-
-30s retry delay нужен для cold start воркера: при `min-instances=0` инстанс поднимается ~10–15s, retry через 30s уже попадёт в живой инстанс.
+- `min-retry-delay` / `max-retry-delay` — учитывайте cold start converter'а (~10–15s к min-instances=0): слишком короткий retry delay попадёт в ещё не поднявшийся инстанс и снова получит "no available instance".
 
 Применить вручную:
 ```bash
@@ -105,57 +100,60 @@ Workflow: `.github/workflows/deploy-photo-converter-bot.yml`
 ### GitHub Secrets
 
 - `GCP_PROJECT`, `GCP_WIF_PROVIDER`, `GCP_SA_EMAIL`, `GCP_REGION`
-- `CLOUD_RUN_CONVERTER_SERVICE`, `CLOUD_RUN_BOT_SERVICE`, `CLOUD_RUN_WORKER_SERVICE`
+- `CLOUD_RUN_CONVERTER_SERVICE`, `CLOUD_RUN_BOT_SERVICE`
 - `CONVERTER_API_KEY`, `BOT_TOKEN`, `TG_WEBHOOK_SECRET`
 
 ### GitHub Variables
 
 - `ALLOWED_EDITORS`, `CHAT_ID`, `TOPIC_SOURCE_ID`, `TOPIC_CONVERTED_ID`
-- `GCP_PUBSUB_TOPIC`, `MAX_FILE_MB` (опционально)
+- `PUBSUB_TOPIC`, `MAX_FILE_MB`, `CONVERTER_MAX_INSTANCES`, `CONVERSION_QUALITY` (опционально)
+
+После первого деплоя converter'а (или при смене URL) перезапустить `scripts/setup-pubsub.sh` с новым `CONVERTER_SERVICE_URL`.
 
 ---
 
 ## Локальный запуск
 
-### Converter
+### Converter (обслуживает и `/convert`, и `/pubsub/push`)
 
 ```bash
 cd converter
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 export CONVERTER_API_KEY=secret
-uvicorn app:app --reload --port 8080
-```
-
-### Worker
-
-```bash
-cd worker
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
 export BOT_TOKEN=<TOKEN>
 export CHAT_ID=-100123456
 export TOPIC_CONVERTED_ID=11
-export CONVERTER_URL=http://localhost:8080
-export CONVERTER_API_KEY=secret
-uvicorn main:app --reload --port 8081
+uvicorn app:app --reload --port 8080
 ```
 
 ---
 
 ## Troubleshooting
 
-### Воркер не обрабатывает задания (cold start burst)
+### "The request was aborted because there was no available instance"
 
-Симптом: в логах `photo-convert-worker` много `"no available instance"` за ~30 секунд.
+Симптом: в логах `photo-converter` много таких ошибок при пачковой загрузке.
 
-Причина: `min-instances=0`, Pub/Sub не ждёт пока инстанс поднимется.
+Причина: `min-instances=0` + `concurrency=1`, а размер пачки превысил `max-instances`. Дополнительно cold start (~10-15s) съедает время до того, как новый инстанс станет доступен.
 
-Проверьте retry policy подписки:
+Проверить/поднять лимит:
+```bash
+gcloud run services describe <CLOUD_RUN_CONVERTER_SERVICE> \
+  --region=<GCP_REGION> --project=<GCP_PROJECT> \
+  --format="value(spec.template.metadata.annotations['autoscaling.knative.dev/maxScale'])"
+```
+Поднять через переменную `CONVERTER_MAX_INSTANCES` и передеплоить, либо вручную:
+```bash
+gcloud run services update <CLOUD_RUN_CONVERTER_SERVICE> \
+  --region=<GCP_REGION> --project=<GCP_PROJECT> \
+  --max-instances=40
+```
+
+Также проверьте retry policy подписки — она должна давать инстансу время подняться:
 ```bash
 gcloud pubsub subscriptions describe tg-convert-jobs-push \
   --project=<GCP_PROJECT> --format="yaml(retryPolicy)"
-# Ожидаемо: minimumBackoff: 30s, maximumBackoff: 300s
 ```
 
 ### 401 от webhook бота
@@ -163,11 +161,9 @@ gcloud pubsub subscriptions describe tg-convert-jobs-push \
 1. `TG_WEBHOOK_SECRET` в env совпадает с тем что передано в `setWebhook`.
 2. Telegram шлёт заголовок `X-Telegram-Bot-Api-Secret-Token`.
 
-### 403/401 при вызове converter
+### 401 при ручном вызове `/convert`
 
-1. Worker отправляет правильный `X-API-KEY`.
-2. `CONVERTER_API_KEY` одинаковый в worker и converter.
-3. Converter публичный: `allUsers` + `roles/run.invoker`.
+1. Заголовок `X-API-KEY` передан и совпадает с `CONVERTER_API_KEY` на сервисе.
 
 ### 422 при конвертации RAW
 

@@ -2,21 +2,24 @@
 
 ## Overview
 
-The bot now uses Google Cloud Pub/Sub for asynchronous, reliable processing of conversion jobs. This architecture ensures:
+The bot uses Google Cloud Pub/Sub for asynchronous, reliable processing of conversion jobs. This architecture ensures:
 
 - **Stability at min=0**: Webhook doesn't drop when bot scales to zero
 - **No lost jobs**: Pub/Sub queues jobs and retries on failures
-- **Batch processing**: Workers can process 30+ files concurrently with retries
+- **Burst tolerance**: Cloud Run scales converter instances to absorb large batches (500+ files)
 - **RAW support**: Full support for ARW and other RAW formats
 
 ## Architecture
 
 ```
-Telegram -> Bot (webhook) -> Pub/Sub Topic -> Worker -> Converter
-                                    |
-                                    v
-                              Cloud Storage (optional)
+Telegram -> Bot (webhook) -> Pub/Sub Topic -> Converter
 ```
+
+The former standalone `worker` service was merged into `converter` (see git history
+prior to this merge) so a file's bytes cross the network exactly once each way
+(Telegram -> converter, converter -> Telegram), instead of being relayed twice
+(Telegram -> worker -> converter, and back). This also halves the number of
+services that can cold-start per burst.
 
 ### Components
 
@@ -32,16 +35,21 @@ Telegram -> Bot (webhook) -> Pub/Sub Topic -> Worker -> Converter
    - Ack deadline: 600s
    - Retry: 10s - 600s exponential backoff
 
-3. **Worker (photo-convert-worker)**
-   - Receives push from Pub/Sub
-   - Downloads file from Telegram
-   - Converts via converter service
-   - Uploads result to Telegram
-   - Idempotent by `file_unique_id`
-
-4. **Converter (photo-converter)**
-   - Converts RAW/HEIC/WebP to JPEG
+3. **Converter (photo-converter)**
+   - Receives push from Pub/Sub at `/pubsub/push`
+   - Downloads file from Telegram directly (via aiogram `Bot`)
+   - Converts RAW/HEIC/WebP/TIFF to JPEG in-process
    - Supports ARW, DNG, CR2, CR3, NEF, RAF, etc.
+   - Uploads result to Telegram
+   - Idempotent by `file_unique_id` (in-memory per instance — see Known limitations)
+   - Also exposes `/convert` (multipart HTTP) for manual testing, guarded by `CONVERTER_API_KEY`
+
+## Known limitations
+
+- Idempotency dedup (`_processed_jobs`) lives in each instance's memory, not a
+  shared store. Under Cloud Run autoscaling, a Pub/Sub retry that lands on a
+  different instance (or a recycled one) will not be recognized as a duplicate.
+  Acceptable for a low-volume personal bot; would need Firestore/Redis if that changes.
 
 ## Deployment
 
@@ -63,7 +71,6 @@ GitHub Actions secrets:
 - `TG_WEBHOOK_SECRET` (Secret Manager version 2)
 - `CONVERTER_API_KEY`
 - `CLOUD_RUN_BOT_SERVICE`
-- `CLOUD_RUN_WORKER_SERVICE`
 - `CLOUD_RUN_CONVERTER_SERVICE`
 
 GitHub Actions variables:
@@ -73,52 +80,36 @@ GitHub Actions variables:
 - `TOPIC_SOURCE_ID`
 - `TOPIC_CONVERTED_ID`
 - `PUBSUB_TOPIC` (optional, default: `tg-convert-jobs`)
+- `CONVERTER_MAX_INSTANCES` (optional, default: `20`)
+- `CONVERSION_QUALITY` (optional, default: `92`)
 
-### Step 1: Deploy Converter
+### Step 1: Deploy Converter + Bot
 
 ```bash
 gh workflow run deploy-photo-converter-bot.yml
 ```
 
 This deploys:
-- Converter service (min=0, max=3, cpu=2, mem=4Gi, timeout=600s)
+- Converter service (min=0, max=20, cpu=2, mem=4Gi, concurrency=1, timeout=600s) —
+  handles both `/convert` (manual HTTP testing) and `/pubsub/push` (the real job path)
+- Bot service (min=0, max=10, cpu=1, mem=512Mi, concurrency=30)
+- With `ENABLE_WEBHOOK_SETUP=false`
 
-### Step 2: Deploy Worker
-
-```bash
-gh workflow run deploy-worker.yml
-```
-
-This deploys:
-- Worker service (min=0, max=2, cpu=1, mem=1Gi, timeout=600s, concurrency=1)
-
-### Step 3: Setup Pub/Sub Infrastructure
+### Step 2: Setup Pub/Sub Infrastructure
 
 ```bash
 export GCP_PROJECT="your-project"
 export GCP_REGION="us-central1"
-export WORKER_SERVICE_URL="https://worker-service-xxx.run.app"
+export CONVERTER_SERVICE_URL="https://photo-converter-xxx.run.app"
 
 ./scripts/setup-pubsub.sh
 ```
 
 This creates:
 - Pub/Sub topic: `tg-convert-jobs`
-- Push subscription to worker endpoint
+- Push subscription to the converter's `/pubsub/push` endpoint
 
-### Step 4: Deploy Bot
-
-Update GitHub variables if needed, then:
-
-```bash
-gh workflow run deploy-photo-converter-bot.yml
-```
-
-This deploys:
-- Bot service (min=0, max=10, cpu=1, mem=512Mi, concurrency=30)
-- With `ENABLE_WEBHOOK_SETUP=false`
-
-### Step 5: Setup Telegram Webhook (Manual, Once)
+### Step 3: Setup Telegram Webhook (Manual, Once)
 
 ```bash
 export BOT_TOKEN="your-bot-token"
@@ -157,10 +148,7 @@ curl "https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo" | jq .
 # Bot logs
 gcloud run services logs read photo-convert-bot --region=$GCP_REGION --project=$GCP_PROJECT
 
-# Worker logs
-gcloud run services logs read photo-convert-worker --region=$GCP_REGION --project=$GCP_PROJECT
-
-# Converter logs
+# Converter logs (also handles job processing)
 gcloud run services logs read photo-converter --region=$GCP_REGION --project=$GCP_PROJECT
 ```
 
@@ -168,7 +156,7 @@ gcloud run services logs read photo-converter --region=$GCP_REGION --project=$GC
 
 1. Send a test file (HEIC, ARW, DNG, etc.) to the bot
 2. Check bot logs: should see `pubsub_published`
-3. Check worker logs: should see `job_success`
+3. Check converter logs: should see `job_success`
 4. Check Telegram: converted file should appear in target topic
 
 ## Troubleshooting
@@ -181,13 +169,20 @@ gcloud run services logs read photo-converter --region=$GCP_REGION --project=$GC
 ### Jobs not processing
 
 - Check Pub/Sub subscription status
-- Verify worker is deployed and accessible
-- Check worker logs for errors
+- Verify converter is deployed and accessible at `/pubsub/push`
+- Check converter logs for errors
+
+### "The request was aborted because there was no available instance"
+
+- This means Cloud Run ran out of converter instances for the burst size —
+  raise `CONVERTER_MAX_INSTANCES` (GitHub variable) and redeploy
+- Since `concurrency=1` (CPU-bound RAW decoding), only `max-instances` controls
+  how many files convert in parallel — do not raise concurrency instead
 
 ### High pending_update_count
 
 - Check Pub/Sub dead letter queue
-- Verify worker concurrency and timeout settings
+- Verify converter's `max-instances` and timeout settings
 - Check for stuck messages
 
 ### ARW files not converting
@@ -207,20 +202,11 @@ gcloud run services logs read photo-converter --region=$GCP_REGION --project=$GC
 - timeout: default (300s)
 - cpu-throttling: true
 
-### Worker
-- min-instances: 0
-- max-instances: 2
-- cpu: 1
-- memory: 1Gi
-- concurrency: 1 (sequential processing)
-- timeout: 600s
-- cpu-throttling: true
-
 ### Converter
 - min-instances: 0
-- max-instances: 3
+- max-instances: 20 (raise via `CONVERTER_MAX_INSTANCES` for larger bursts)
 - cpu: 2
 - memory: 4Gi
-- concurrency: 1
+- concurrency: 1 (CPU-bound RAW decoding — scale via instance count, not concurrency)
 - timeout: 600s
 - cpu-throttling: true
