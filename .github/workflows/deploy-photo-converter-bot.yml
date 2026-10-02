@@ -241,7 +241,6 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           BOT_URL: ${{ vars.BOT_URL }}
-          ALLOWED_EDITORS: ${{ vars.ALLOWED_EDITORS }}
           CHAT_ID: ${{ vars.CHAT_ID }}
           TOPIC_SOURCE_ID: ${{ vars.TOPIC_SOURCE_ID }}
           TOPIC_CONVERTED_ID: ${{ vars.TOPIC_CONVERTED_ID }}
@@ -256,7 +255,6 @@ jobs:
             CLOUD_RUN_BOT_SERVICE
             CONVERTER_API_KEY
             BOT_URL
-            ALLOWED_EDITORS
             CHAT_ID
             TOPIC_SOURCE_ID
             TOPIC_CONVERTED_ID
@@ -429,7 +427,6 @@ jobs:
           image: ${{ steps.build_push_bot.outputs.image_uri }}
           env_vars: |
             BOT_TOKEN=${{ secrets.BOT_TOKEN != '' && secrets.BOT_TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
-            ALLOWED_EDITORS=${{ vars.ALLOWED_EDITORS }}
             CHAT_ID=${{ vars.CHAT_ID }}
             TOPIC_SOURCE_ID=${{ vars.TOPIC_SOURCE_ID }}
             TOPIC_CONVERTED_ID=${{ vars.TOPIC_CONVERTED_ID }}
